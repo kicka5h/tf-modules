@@ -132,8 +132,9 @@ infra-networking/
 │       ├── backend.tf
 │       └── prod.tfvars
 └── .github/workflows/
-    ├── terraform.yml           # copy from terraform-pipeline-caller-template.yml
-    └── blocklist-refresh.yml   # copy from blocklist-refresh-caller-template.yml (if using blocklist modules)
+    ├── terraform.yml           # CI/CD pipeline (PR validate + merge deploy)
+    ├── drift-detection.yml     # scheduled drift checks (daily)
+    └── blocklist-refresh.yml   # scheduled blocklist updates (every 6h)
 ```
 
 **`shared/main.tf`** — IPAM feeds addresses into all networking modules:
@@ -520,6 +521,69 @@ If `INFRACOST_API_KEY` is not configured, all cost estimation steps are skipped.
 | qa | Yes | No | Skipped |
 | stage | After qa | Yes | Enforced |
 | prod | After stage | Yes | Enforced |
+
+## Drift Detection
+
+A reusable workflow at `.github/workflows/drift-detection.yml` that runs on a schedule to detect infrastructure changes made outside of Terraform (manual portal changes, CLI modifications, other automation).
+
+### How it works
+
+1. Runs `terraform plan -detailed-exitcode` for each environment
+2. Exit code 0 = no drift, exit code 2 = drift detected
+3. Queries Azure Activity Log for write/delete operations to identify **who** made the change
+4. Posts a summary to the workflow step summary with resource counts, plan output, and activity log
+5. Creates or updates a GitHub issue per environment with full details and remediation steps
+
+### Azure Activity Log integration
+
+When drift is detected, the workflow queries the Azure Activity Log for the resource group over the last 7 days. It filters for non-read operations and includes a table in the issue showing:
+
+| Column | What it shows |
+| --- | --- |
+| Who | The caller identity (email, service principal, or managed identity) |
+| Action | The ARM operation (e.g., `Microsoft.Network/virtualNetworks/write`) |
+| When | Timestamp of the operation |
+| Status | Success/failure |
+
+This answers the critical question: "who changed this outside of Terraform?" — whether it was a portal user, a CLI script, or another automation tool.
+
+### Issue behavior
+
+- **New drift:** Creates a new issue titled "Infrastructure drift detected: {env}" with assignees, labels, and activity log
+- **Recurring drift:** Adds a comment to the existing open issue with the latest detection timestamp and updated activity log
+- **Resolved drift:** Team closes the issue manually. A new issue is created if drift recurs.
+
+Each issue includes:
+- Which resources changed (add/change/destroy counts)
+- Azure Activity Log showing who made changes and when
+- Link to the workflow run with full plan output
+- Remediation checklist (import, revert, or apply)
+
+### Configuration
+
+| Input | Default | Description |
+| --- | --- | --- |
+| `environments` | `""` (all) | JSON array of environments to check. Empty checks all. |
+| `create_issues` | `true` | Create GitHub issues when drift is detected |
+| `issue_assignees` | `""` | Comma-separated GitHub usernames to assign drift issues |
+| `issue_labels` | `"drift,infrastructure,automated"` | Labels for drift issues |
+
+### Setup
+
+Copy `.github/workflows/drift-detection-caller-template.yml` to your caller repo. Recommended schedule:
+
+| Environment | Frequency | Rationale |
+| --- | --- | --- |
+| prod | Daily at 6 AM UTC | Catch unauthorized changes early |
+| stage | Daily | Pre-prod should match code |
+| qa | Weekly | Less critical |
+| dev | Weekly or disabled | Drift is expected in dev |
+
+Manual trigger is also supported via `workflow_dispatch` — useful during incident response to check specific environments:
+
+```bash
+gh workflow run drift-detection.yml -f environments='["prod"]'
+```
 
 ## Blocklist Refresh Pipeline
 

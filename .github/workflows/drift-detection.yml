@@ -1,0 +1,346 @@
+# Reusable drift detection workflow.
+#
+# Runs on a schedule to detect infrastructure changes made outside of Terraform
+# (e.g., manual Azure portal changes, CLI modifications, other automation).
+#
+# For each environment:
+#   1. Runs terraform plan with -detailed-exitcode
+#   2. If drift is detected (exit code 2), creates a GitHub issue and/or sends a notification
+#   3. Posts a summary of drifted resources
+#
+# Drift is informational — it does NOT auto-remediate. The team reviews
+# and decides whether to import, revert, or update Terraform code.
+
+name: Drift Detection
+
+on:
+  workflow_call:
+    inputs:
+      shared_directory:
+        description: "Directory containing the shared Terraform code"
+        required: false
+        type: string
+        default: "shared"
+      environments_directory:
+        description: "Base directory containing environment subdirectories"
+        required: false
+        type: string
+        default: "environments"
+      terraform_version:
+        description: "Terraform version to use"
+        required: false
+        type: string
+        default: "latest"
+      environments:
+        description: "JSON array of environments to check (e.g., '[\"dev\",\"qa\",\"stage\",\"prod\"]'). If empty, checks all."
+        required: false
+        type: string
+        default: ""
+      create_issues:
+        description: "Create a GitHub issue when drift is detected"
+        required: false
+        type: boolean
+        default: true
+      issue_assignees:
+        description: "Comma-separated list of GitHub usernames to assign drift issues to"
+        required: false
+        type: string
+        default: ""
+      issue_labels:
+        description: "Comma-separated list of labels for drift issues"
+        required: false
+        type: string
+        default: "drift,infrastructure,automated"
+    secrets:
+      ARM_CLIENT_ID:
+        required: true
+      ARM_CLIENT_SECRET:
+        required: true
+      ARM_SUBSCRIPTION_ID:
+        required: true
+      ARM_TENANT_ID:
+        required: true
+
+jobs:
+  detect-environments:
+    name: Detect environments
+    runs-on: ubuntu-latest
+    outputs:
+      environments: ${{ steps.detect.outputs.environments }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect environments
+        id: detect
+        run: |
+          ENV_DIR="${{ inputs.environments_directory }}"
+
+          if [ -n '${{ inputs.environments }}' ] && [ '${{ inputs.environments }}' != '' ]; then
+            echo "environments=${{ inputs.environments }}" >> "$GITHUB_OUTPUT"
+          else
+            ENVS=()
+            for DIR in "$ENV_DIR"/*/; do
+              ENV_NAME=$(basename "$DIR")
+              ENVS+=("$ENV_NAME")
+            done
+            JSON=$(printf '%s\n' "${ENVS[@]}" | jq -R . | jq -sc .)
+            echo "environments=$JSON" >> "$GITHUB_OUTPUT"
+          fi
+
+  check-drift:
+    name: "Drift check (${{ matrix.environment }})"
+    needs: detect-environments
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: ${{ fromJson(needs.detect-environments.outputs.environments) }}
+    env:
+      ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+      ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+    outputs:
+      drift_detected: ${{ steps.plan.outputs.drift_detected }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+
+      - name: Prepare working directory
+        run: |
+          WORK_DIR="${{ inputs.shared_directory }}"
+          ENV_DIR="${{ inputs.environments_directory }}/${{ matrix.environment }}"
+          if [ -f "$ENV_DIR/backend.tf" ]; then
+            cp "$ENV_DIR/backend.tf" "$WORK_DIR/backend.tf"
+          fi
+
+      - name: Terraform Init
+        working-directory: ${{ inputs.shared_directory }}
+        run: terraform init
+
+      - name: Terraform Plan (drift check)
+        id: plan
+        working-directory: ${{ inputs.shared_directory }}
+        run: |
+          ENV_DIR="${{ github.workspace }}/${{ inputs.environments_directory }}/${{ matrix.environment }}"
+          TFVARS=$(find "$ENV_DIR" -name "*.tfvars" -o -name "*.tfvars.json" | head -20)
+
+          VAR_FILE_ARGS=""
+          for f in $TFVARS; do
+            VAR_FILE_ARGS="$VAR_FILE_ARGS -var-file=$f"
+          done
+
+          set +e
+          terraform plan $VAR_FILE_ARGS -detailed-exitcode -no-color -out=tfplan 2>&1 | tee /tmp/plan-output.txt
+          EXIT_CODE=$?
+          set -e
+
+          if [ $EXIT_CODE -eq 0 ]; then
+            echo "drift_detected=false" >> "$GITHUB_OUTPUT"
+            echo "drift_summary=No drift detected" >> "$GITHUB_OUTPUT"
+            echo "No drift detected in ${{ matrix.environment }}."
+          elif [ $EXIT_CODE -eq 2 ]; then
+            echo "drift_detected=true" >> "$GITHUB_OUTPUT"
+
+            # Extract resource changes
+            terraform show -no-color tfplan > /tmp/plan-show.txt
+
+            # Count changes
+            ADDS=$(grep -c "will be created" /tmp/plan-show.txt 2>/dev/null || echo "0")
+            CHANGES=$(grep -c "will be updated" /tmp/plan-show.txt 2>/dev/null || echo "0")
+            DESTROYS=$(grep -c "will be destroyed" /tmp/plan-show.txt 2>/dev/null || echo "0")
+
+            SUMMARY="$ADDS to add, $CHANGES to change, $DESTROYS to destroy"
+            echo "drift_summary=$SUMMARY" >> "$GITHUB_OUTPUT"
+            echo "::warning::Drift detected in ${{ matrix.environment }}: $SUMMARY"
+          else
+            echo "drift_detected=error" >> "$GITHUB_OUTPUT"
+            echo "drift_summary=Plan failed" >> "$GITHUB_OUTPUT"
+            echo "::error::Terraform plan failed for ${{ matrix.environment }}"
+          fi
+
+      - name: Post drift summary
+        run: |
+          echo "## Drift Detection: ${{ matrix.environment }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${{ steps.plan.outputs.drift_detected }}" = "true" ]; then
+            echo "**Status: DRIFT DETECTED**" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Changes: ${{ steps.plan.outputs.drift_summary }}" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "This means infrastructure in Azure differs from what Terraform expects." >> "$GITHUB_STEP_SUMMARY"
+            echo "Possible causes: manual portal changes, CLI modifications, other automation." >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            head -200 /tmp/plan-output.txt >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+            # Include activity log if available
+            if [ -n "${{ steps.activity.outputs.activity_log }}" ]; then
+              echo "" >> "$GITHUB_STEP_SUMMARY"
+              echo "### Azure Activity Log (who made changes)" >> "$GITHUB_STEP_SUMMARY"
+              echo "" >> "$GITHUB_STEP_SUMMARY"
+              echo "${{ steps.activity.outputs.activity_log }}" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          elif [ "${{ steps.plan.outputs.drift_detected }}" = "false" ]; then
+            echo "**Status: No drift**" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Infrastructure matches Terraform state." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "**Status: ERROR**" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Terraform plan failed. Check the logs." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Query Azure Activity Log (who caused drift)
+        id: activity
+        if: steps.plan.outputs.drift_detected == 'true'
+        run: |
+          # Install Azure CLI if not present
+          if ! command -v az &> /dev/null; then
+            curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+          fi
+
+          # Login with service principal
+          az login --service-principal \
+            -u "$ARM_CLIENT_ID" \
+            -p "$ARM_CLIENT_SECRET" \
+            --tenant "$ARM_TENANT_ID" \
+            --output none 2>/dev/null
+
+          az account set --subscription "$ARM_SUBSCRIPTION_ID" 2>/dev/null
+
+          # Extract resource group from tfvars or plan output
+          ENV_DIR="${{ github.workspace }}/${{ inputs.environments_directory }}/${{ matrix.environment }}"
+          RG_NAME=$(grep -h 'resource_group_name' "$ENV_DIR"/*.tfvars 2>/dev/null | head -1 | sed 's/.*=\s*"\(.*\)"/\1/' || echo "")
+
+          if [ -z "$RG_NAME" ]; then
+            echo "Could not determine resource group name from tfvars."
+            echo "activity_log=Unable to determine resource group for activity log query." >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Querying activity log for resource group: $RG_NAME"
+
+          # Query last 7 days of write/delete operations (covers weekly drift checks)
+          START_TIME=$(date -u -d "7 days ago" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v-7d +%Y-%m-%dT%H:%M:%SZ)
+
+          ACTIVITY=$(az monitor activity-log list \
+            --resource-group "$RG_NAME" \
+            --start-time "$START_TIME" \
+            --query "[?authorization.action != null && !contains(authorization.action, 'read')].{caller:caller, action:authorization.action, time:eventTimestamp, status:status.value}" \
+            --output json 2>/dev/null || echo "[]")
+
+          # Format activity log for the issue
+          ACTIVITY_REPORT=$(echo "$ACTIVITY" | python3 -c "
+          import json, sys
+          data = json.load(sys.stdin)
+          if not data:
+              print('No non-read operations found in the last 7 days.')
+              sys.exit(0)
+          # Deduplicate by caller+action
+          seen = set()
+          lines = []
+          for entry in data:
+              key = f\"{entry.get('caller','unknown')}-{entry.get('action','unknown')}\"
+              if key not in seen:
+                  seen.add(key)
+                  lines.append(f\"| {entry.get('caller','unknown')} | {entry.get('action','unknown')} | {entry.get('time','unknown')[:19]} | {entry.get('status','unknown')} |\")
+          print('| Who | Action | When | Status |')
+          print('| --- | --- | --- | --- |')
+          for l in lines[:30]:
+              print(l)
+          if len(data) > 30:
+              print(f'| ... | {len(data)-30} more entries | | |')
+          " 2>/dev/null || echo "Activity log query failed.")
+
+          # Save to output (escape newlines for GitHub Actions)
+          EOF_MARKER=$(dd if=/dev/urandom bs=15 count=1 2>/dev/null | base64)
+          echo "activity_log<<$EOF_MARKER" >> "$GITHUB_OUTPUT"
+          echo "$ACTIVITY_REPORT" >> "$GITHUB_OUTPUT"
+          echo "$EOF_MARKER" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub issue for drift
+        if: steps.plan.outputs.drift_detected == 'true' && inputs.create_issues
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const env = '${{ matrix.environment }}';
+            const summary = '${{ steps.plan.outputs.drift_summary }}';
+            const repo = context.repo;
+            const title = `Infrastructure drift detected: ${env}`;
+            const assignees = '${{ inputs.issue_assignees }}'.split(',').map(s => s.trim()).filter(s => s);
+            const labels = '${{ inputs.issue_labels }}'.split(',').map(s => s.trim()).filter(s => s);
+
+            // Check if an open issue already exists for this environment
+            const existing = await github.rest.issues.listForRepo({
+              ...repo,
+              state: 'open',
+              labels: labels.join(','),
+            });
+
+            const existingIssue = existing.data.find(i => i.title === title);
+
+            const activityLog = `${{ steps.activity.outputs.activity_log }}`;
+
+            const body = [
+              `## Drift detected in \`${env}\``,
+              '',
+              `**Changes:** ${summary}`,
+              `**Detected at:** ${new Date().toISOString()}`,
+              `**Workflow run:** ${context.serverUrl}/${repo.owner}/${repo.repo}/actions/runs/${context.runId}`,
+              '',
+              '### Azure Activity Log (who made changes)',
+              '',
+              activityLog || 'No activity log data available.',
+              '',
+              '### What to do',
+              '',
+              '1. **Review** the activity log above to identify who made the change',
+              '2. **Review** the plan output in the workflow run linked above',
+              '3. **Determine cause** — was this a manual change, emergency fix, or unauthorized modification?',
+              '4. **Remediate** by either:',
+              '   - Updating Terraform code to match the current state (`terraform import` or code changes)',
+              '   - Reverting the manual change in Azure to match Terraform state',
+              '   - Running `terraform apply` to overwrite the drift (after confirming intent)',
+              '',
+              '### Resolution',
+              '',
+              'Close this issue once drift is resolved. A new issue will be created if drift recurs.',
+            ].join('\n');
+
+            if (existingIssue) {
+              // Update existing issue with new detection timestamp
+              await github.rest.issues.createComment({
+                ...repo,
+                issue_number: existingIssue.number,
+                body: [
+                  `Drift still present as of ${new Date().toISOString()}.`,
+                  '',
+                  `**Changes:** ${summary}`,
+                  `**Run:** ${context.serverUrl}/${repo.owner}/${repo.repo}/actions/runs/${context.runId}`,
+                  '',
+                  '**Recent activity log:**',
+                  '',
+                  activityLog || 'No activity log data available.',
+                ].join('\n'),
+              });
+              core.info(`Updated existing issue #${existingIssue.number}`);
+            } else {
+              // Create new issue
+              const issue = await github.rest.issues.create({
+                ...repo,
+                title,
+                body,
+                assignees,
+                labels,
+              });
+              core.info(`Created issue #${issue.data.number}`);
+            }

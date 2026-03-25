@@ -1,0 +1,39 @@
+# TEMPLATE: Copy this file to your caller repo at .github/workflows/drift-detection.yml
+#
+# Runs on a schedule to detect infrastructure changes made outside of Terraform.
+# When drift is found, creates a GitHub issue with remediation steps.
+#
+# Prerequisites:
+#   - ARM_* secrets at repo or environment level
+#   - Labels "drift", "infrastructure", "automated" created in the repo
+#   - (Optional) Set issue_assignees to the on-call or platform team
+
+name: Drift Detection
+
+on:
+  schedule:
+    # Run daily at 6 AM UTC
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+    inputs:
+      environments:
+        description: "JSON array of environments to check (leave empty for all)"
+        required: false
+        default: ""
+
+jobs:
+  drift:
+    uses: <org>/<repo>/.github/workflows/drift-detection.yml@main
+    with:
+      shared_directory: "shared"
+      environments_directory: "environments"
+      terraform_version: "1.9.0"
+      environments: ${{ github.event.inputs.environments || '' }}
+      create_issues: true
+      issue_assignees: ""  # e.g., "platform-lead,sre-oncall"
+      issue_labels: "drift,infrastructure,automated"
+    secrets:
+      ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+      ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
