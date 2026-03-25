@@ -135,26 +135,37 @@ infra-networking/
     └── blocklist-refresh.yml   # copy from blocklist-refresh-caller-template.yml (if using blocklist modules)
 ```
 
-**`shared/main.tf`** example:
+**`shared/main.tf`** — IPAM feeds addresses into all networking modules:
 ```hcl
-module "vnet" {
+module "ipam" {
+  source         = "git::https://github.com/<org>/tf-modules.git//Azure/az-ipam?ref=v1.0.0"
+  root_cidrs     = var.ipam_root_cidrs
+  reserved_cidrs = var.ipam_reserved_cidrs
+  allocations    = { (var.environment) = var.ipam_allocation }
+}
+
+module "vnets" {
   source              = "git::https://github.com/<org>/tf-modules.git//Azure/az-virtual-network?ref=v1.0.0"
   resource_group_name = var.resource_group_name
   location            = var.location
-  vnets               = var.vnets
-  tags                = var.tags
-}
 
-module "nsg" {
-  source              = "git::https://github.com/<org>/tf-modules.git//Azure/az-nsg?ref=v1.0.0"
-  resource_group_name = var.resource_group_name
-  location            = var.location
-  nsgs                = var.nsgs
-  tags                = var.tags
+  vnets = {
+    for vnet_key, vnet in var.ipam_allocation.vnets : vnet_key => {
+      name          = "vnet-${var.environment}-${vnet_key}"
+      address_space = module.ipam.vnet_cidrs["${var.environment}-${vnet_key}"].address_space
+      subnets = {
+        for sk, sv in vnet.subnets : sk => {
+          address_prefixes = module.ipam.subnet_cidrs["${var.environment}-${vnet_key}-${sk}"].address_prefixes
+        }
+      }
+    }
+  }
 }
 ```
 
-**`environments/dev/backend.tf`** example:
+The caller never writes a CIDR — IPAM calculates all addresses. See `examples/full-stack/` for the complete implementation including NSGs, route tables, and auto-association.
+
+**`environments/dev/backend.tf`**:
 ```hcl
 terraform {
   backend "azurerm" {
@@ -166,27 +177,54 @@ terraform {
 }
 ```
 
-**`environments/dev/dev.tfvars`** example:
+**`environments/dev/dev.tfvars`** — defines the shape, not the addresses:
 ```hcl
 resource_group_name = "rg-networking-dev"
 location            = "eastus2"
+environment         = "dev"
 
-vnets = {
-  hub = {
-    name          = "vnet-hub-dev"
-    address_space = ["10.0.0.0/16"]
-    subnets = {
-      default = { address_prefixes = ["10.0.1.0/24"] }
+ipam_allocation = {
+  cidr_newbits = 8      # /16 for this environment
+  cidr_index   = 0      # first /16 from the root /8
+  vnets = {
+    hub = {
+      cidr_newbits = 4   # /20
+      cidr_index   = 0
+      subnets = {
+        GatewaySubnet       = { cidr_newbits = 4, cidr_index = 0 }  # /24
+        AzureFirewallSubnet = { cidr_newbits = 4, cidr_index = 1 }  # /24
+        management          = { cidr_newbits = 4, cidr_index = 2 }  # /24
+      }
+    }
+    spoke = {
+      cidr_newbits = 4
+      cidr_index   = 1
+      subnets = {
+        app  = { cidr_newbits = 2, cidr_index = 0 }  # /22
+        data = { cidr_newbits = 4, cidr_index = 4 }  # /24
+        aks  = { cidr_newbits = 2, cidr_index = 2 }  # /22
+      }
     }
   }
 }
 
-tags = {
-  environment = "dev"
-}
+tags = { environment = "dev" }
 ```
 
-### Step 7: Set up blocklist refresh (caller repos using blocklist modules)
+### Step 7: Discover existing IP allocations
+
+Before deploying, run the discovery script to find CIDRs already in use:
+
+```bash
+az login
+./scripts/discover-ip-allocations.sh --tfvars > environments/dev/reserved.auto.tfvars
+```
+
+This generates `ipam_reserved_cidrs` from all existing VNets/subnets across the tenant. Terraform auto-loads `.auto.tfvars` files. The IPAM module validates that new allocations don't overlap with these reserved ranges.
+
+Run this periodically or before major changes. If infrastructure is managed entirely through these modules, the reserved list only needs to cover resources created outside of Terraform.
+
+### Step 8: Set up blocklist refresh (caller repos using blocklist modules)
 
 Copy the blocklist refresh caller template to any caller repo that uses `az-nsg`, `az-firewall`, `az-application-gateway`, or `az-front-door`:
 
@@ -301,6 +339,34 @@ Modules that auto-generate rules reserve low-priority ranges:
 | Module | Resources |
 | --- | --- |
 | `az-app-service` | Service plans, Linux/Windows web apps |
+
+### IP Address Management (1 module)
+
+| Module | Purpose |
+| --- | --- |
+| `az-ipam` | Algorithmic CIDR allocation with existing infrastructure discovery and overlap detection |
+
+The IPAM module generates non-overlapping IP address spaces from a root CIDR block. A companion discovery script (`scripts/discover-ip-allocations.sh`) queries Azure Resource Graph for all existing VNets, subnets, and public IPs across the tenant. New allocations are validated against these reserved ranges to prevent conflicts.
+
+IPAM is designed to be consumed by other modules — the caller defines the shape of their network (VNet names, subnet names, sizes) and IPAM feeds calculated CIDRs into `az-virtual-network`, `az-nsg`, `az-route-table`, and any other module that needs addresses. The caller never writes a CIDR. See `examples/full-stack/` for a complete reference implementation.
+
+**How it flows:**
+
+```
+Caller .tfvars (shape only)     IPAM module              Networking modules
+┌─────────────────────────┐    ┌──────────────────┐    ┌───────────────────┐
+│ ipam_allocation = {     │    │                  │    │ az-virtual-network│
+│   cidr_newbits = 8      │───>│  cidrsubnet()    │───>│   vnets + subnets │
+│   cidr_index   = 0      │    │  overlap check   │    │                   │
+│   vnets = {             │    │  reserved CIDRs  │    ├───────────────────┤
+│     hub = { subnets }   │    │                  │    │ az-nsg            │
+│     spoke = { subnets } │    └──────────────────┘    │   auto-associate  │
+│   }                     │                            ├───────────────────┤
+│ }                       │                            │ az-route-table    │
+│ nsg_rules = { ... }     │───────────────────────────>│   auto-associate  │
+│ route_tables = { ... }  │                            └───────────────────┘
+└─────────────────────────┘
+```
 
 ## Resources Not Modularized
 
