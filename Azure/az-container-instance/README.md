@@ -105,7 +105,7 @@ module "aci" {
 
 ## Enforced Policies
 
-- **Private IP by default**: Container groups default to `ip_address_type = "Private"`, requiring VNet integration via `subnet_ids`. Public IP must be explicitly opted into.
+- **Private IP enforced**: Container groups must use `ip_address_type = "Private"`. This is validated at plan time; setting `"Public"` will be rejected. VNet integration via `subnet_ids` is required.
 - **Managed identity by default**: Every container group gets a `SystemAssigned` identity unless overridden. This avoids storing credentials for Azure service access.
 - **Default tags**: `Terraform = "true"` is always applied and merged with caller-provided tags.
 - **OS type validation**: Only `"Linux"` and `"Windows"` are accepted; invalid values are rejected at plan time.

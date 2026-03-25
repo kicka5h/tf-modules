@@ -61,6 +61,14 @@ variable "key_vaults" {
     ])
     error_message = "Each Key Vault must have sku_name set to one of: standard, premium."
   }
+
+  validation {
+    condition = alltrue([
+      for k, kv in var.key_vaults :
+      kv.public_network_access_enabled == false
+    ])
+    error_message = "Public network access must be disabled on all Key Vaults (public_network_access_enabled = false)."
+  }
 }
 
 variable "tags" {

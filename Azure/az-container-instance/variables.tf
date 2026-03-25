@@ -62,6 +62,14 @@ variable "container_groups" {
     ])
     error_message = "Each container group must have os_type set to one of: Linux, Windows."
   }
+
+  validation {
+    condition = alltrue([
+      for k, cg in var.container_groups :
+      cg.ip_address_type == "Private"
+    ])
+    error_message = "Each container group must have ip_address_type set to \"Private\". Public container groups are not allowed."
+  }
 }
 
 variable "tags" {

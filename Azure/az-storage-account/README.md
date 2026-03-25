@@ -51,10 +51,10 @@ module "storage" {
 | --- | --- | --- |
 | HTTPS only | `storage_accounts.<key>.enable_https_traffic_only` | `true` (enforced, validation rejects `false`) |
 | Minimum TLS version | `storage_accounts.<key>.min_tls_version` | `"TLS1_2"` (enforced, validation rejects anything else) |
-| Public blob access | `storage_accounts.<key>.allow_nested_items_to_be_public` | `true`, `false` (default: `false`) |
-| Shared access key | `storage_accounts.<key>.shared_access_key_enabled` | `true`, `false` (default: `false`) |
-| Public network access | `storage_accounts.<key>.public_network_access_enabled` | `true`, `false` (default: `false`) |
-| Infrastructure encryption | `storage_accounts.<key>.infrastructure_encryption_enabled` | `true`, `false` (default: `true`) |
+| Public blob access | `storage_accounts.<key>.allow_nested_items_to_be_public` | `false` (enforced, validation rejects `true`) |
+| Shared access key | `storage_accounts.<key>.shared_access_key_enabled` | `false` (enforced, validation rejects `true`) |
+| Public network access | `storage_accounts.<key>.public_network_access_enabled` | `false` (enforced, validation rejects `true`) |
+| Infrastructure encryption | `storage_accounts.<key>.infrastructure_encryption_enabled` | `true` (enforced, validation rejects `false`) |
 
 ### Networking
 
@@ -128,10 +128,10 @@ module "storage" {
 
 - **HTTPS only**: Validation rejects any storage account with `enable_https_traffic_only = false`. All traffic must use HTTPS.
 - **TLS 1.2 minimum**: Validation rejects any storage account with `min_tls_version` set to anything other than `"TLS1_2"`.
-- **Public blob access disabled**: Storage accounts default to `allow_nested_items_to_be_public = false`, preventing anonymous access to blob data.
-- **Shared access key disabled**: Storage accounts default to `shared_access_key_enabled = false`. Use Azure AD authentication instead.
-- **Public network access disabled**: Storage accounts default to `public_network_access_enabled = false`. Use private endpoints for connectivity.
-- **Infrastructure encryption enabled**: Storage accounts default to `infrastructure_encryption_enabled = true` for double encryption at the infrastructure layer.
+- **Public blob access disabled**: Validation rejects any storage account with `allow_nested_items_to_be_public = true`. Anonymous access to blob data is not permitted.
+- **Shared access key disabled**: Validation rejects any storage account with `shared_access_key_enabled = true`. Use Azure AD authentication instead.
+- **Public network access disabled**: Validation rejects any storage account with `public_network_access_enabled = true`. Use private endpoints for connectivity.
+- **Infrastructure encryption enabled**: Validation rejects any storage account with `infrastructure_encryption_enabled = false`. Double encryption at the infrastructure layer is required.
 - **Geo-redundant replication**: Storage accounts default to `account_replication_type = "GRS"` for cross-region redundancy.
 - **Blob versioning enabled**: Blob properties default to `versioning_enabled = true` and `change_feed_enabled = true`.
 - **Soft delete enabled**: Both blob and container soft delete default to 30-day retention.

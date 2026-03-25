@@ -63,6 +63,14 @@ variable "container_registries" {
     ])
     error_message = "Admin user must be disabled on all container registries (admin_enabled = false)."
   }
+
+  validation {
+    condition = alltrue([
+      for k, r in var.container_registries :
+      r.public_network_access_enabled == false
+    ])
+    error_message = "Public network access must be disabled on all container registries (public_network_access_enabled = false)."
+  }
 }
 
 variable "tags" {

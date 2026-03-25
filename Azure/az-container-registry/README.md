@@ -48,7 +48,7 @@ Premium is the default and is required for private endpoints, zone redundancy, g
 
 | What | Variable Path | Valid Values |
 | --- | --- | --- |
-| Public network access | `container_registries.<key>.public_network_access_enabled` | `true`, `false` (default: `false`) |
+| Public network access | `container_registries.<key>.public_network_access_enabled` | `false` (enforced, validation rejects `true`) |
 | Network rule bypass | `container_registries.<key>.network_rule_bypass_option` | `"AzureServices"`, `"None"` (default: `"AzureServices"`) |
 
 ### Zone Redundancy
@@ -105,7 +105,7 @@ Only available on Premium SKU.
 
 - **Premium SKU default**: All registries default to Premium SKU, enabling private endpoints, zone redundancy, geo-replication, content trust, and retention policies.
 - **Admin user disabled**: Validation rejects any registry with `admin_enabled = true`. Use RBAC or service principals for authentication.
-- **Public network access disabled**: Registries are not publicly accessible by default. Use private endpoints for connectivity.
+- **Public network access disabled**: Validation rejects any registry with `public_network_access_enabled = true`. Use private endpoints for connectivity.
 - **Zone redundancy enabled**: Registries are zone-redundant by default for high availability.
 - **Content trust enabled**: Image signing (trust policy) is enabled by default.
 - **Retention policy**: Untagged manifests are automatically purged after 30 days by default.

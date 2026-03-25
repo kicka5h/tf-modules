@@ -15,9 +15,11 @@ variable "aks_clusters" {
     dns_prefix         = string
     kubernetes_version = optional(string, null)
     sku_tier           = optional(string, "Standard") # "Free", "Standard", "Premium"
-    # Enforce: private cluster
-    private_cluster_enabled = optional(bool, true)
-    private_dns_zone_id     = optional(string, null)
+    # Enforce: private cluster with no public FQDN or API access
+    private_cluster_enabled             = optional(bool, true)
+    private_cluster_public_fqdn_enabled = optional(bool, false)
+    public_network_access_enabled       = optional(bool, false)
+    private_dns_zone_id                 = optional(string, null)
     # Enforce: RBAC
     role_based_access_control_enabled = optional(bool, true)
     azure_active_directory_role_based_access_control = optional(object({
@@ -109,6 +111,30 @@ variable "aks_clusters" {
       c.role_based_access_control_enabled == true
     ])
     error_message = "RBAC must be enabled on all AKS clusters (role_based_access_control_enabled = true)."
+  }
+
+  validation {
+    condition = alltrue([
+      for k, c in var.aks_clusters :
+      c.private_cluster_enabled == true
+    ])
+    error_message = "All AKS clusters must be private (private_cluster_enabled = true)."
+  }
+
+  validation {
+    condition = alltrue([
+      for k, c in var.aks_clusters :
+      c.private_cluster_public_fqdn_enabled == false
+    ])
+    error_message = "Public FQDN must be disabled on all private AKS clusters (private_cluster_public_fqdn_enabled = false)."
+  }
+
+  validation {
+    condition = alltrue([
+      for k, c in var.aks_clusters :
+      c.public_network_access_enabled == false
+    ])
+    error_message = "Public network access must be disabled on all AKS clusters (public_network_access_enabled = false)."
   }
 }
 

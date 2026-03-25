@@ -58,7 +58,7 @@ RBAC is the default and recommended authorization model. Access policies are onl
 
 | What | Variable Path | Valid Values |
 | --- | --- | --- |
-| Public network access | `key_vaults.<key>.public_network_access_enabled` | `true`, `false` (default: `false`) |
+| Public network access | `key_vaults.<key>.public_network_access_enabled` | `false` (enforced, validation rejects `true`) |
 | Network ACLs default action | `key_vaults.<key>.network_acls.default_action` | `"Allow"`, `"Deny"` (default: `"Deny"`) |
 | Network ACLs bypass | `key_vaults.<key>.network_acls.bypass` | `"AzureServices"`, `"None"` (default: `"AzureServices"`) |
 | IP rules | `key_vaults.<key>.network_acls.ip_rules` | List of CIDR ranges (default: `[]`) |
@@ -97,7 +97,7 @@ Access policies are only created when `enable_rbac_authorization = false`. If `t
 - **Premium SKU default**: All vaults default to premium SKU, enabling HSM-backed keys.
 - **Purge protection enabled**: Validation rejects any vault with `purge_protection_enabled = false`. This is critical for compliance and prevents permanent data loss.
 - **RBAC authorization default**: Vaults use Azure RBAC by default, which is the recommended authorization model over access policies.
-- **Public network access disabled**: Vaults are not publicly accessible by default. Use private endpoints and network ACLs for connectivity.
+- **Public network access disabled**: Validation rejects any vault with `public_network_access_enabled = true`. Vaults must use private endpoints and network ACLs for connectivity.
 - **Network ACLs default deny**: When network ACLs are configured, the default action is Deny with AzureServices bypass.
 - **Soft delete 90 days**: Deleted vaults and their contents are retained for 90 days by default.
 - **Deployment access enabled**: Vaults are accessible by VMs, disk encryption, and ARM templates by default.

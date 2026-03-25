@@ -44,8 +44,10 @@ resource "azurerm_kubernetes_cluster" "this" {
   kubernetes_version  = each.value.kubernetes_version
   sku_tier            = each.value.sku_tier
 
-  private_cluster_enabled = each.value.private_cluster_enabled
-  private_dns_zone_id     = each.value.private_dns_zone_id
+  private_cluster_enabled             = each.value.private_cluster_enabled
+  private_cluster_public_fqdn_enabled = each.value.private_cluster_public_fqdn_enabled
+  public_network_access_enabled       = each.value.public_network_access_enabled
+  private_dns_zone_id                 = each.value.private_dns_zone_id
 
   role_based_access_control_enabled = each.value.role_based_access_control_enabled
 

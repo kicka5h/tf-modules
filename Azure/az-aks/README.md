@@ -55,7 +55,9 @@ module "aks" {
 | DNS prefix | `aks_clusters.<key>.dns_prefix` | Unique DNS prefix |
 | Kubernetes version | `aks_clusters.<key>.kubernetes_version` | Version string or `null` (latest) |
 | SKU tier | `aks_clusters.<key>.sku_tier` | `"Free"`, `"Standard"`, `"Premium"` |
-| Private cluster | `aks_clusters.<key>.private_cluster_enabled` | `true` (default), `false` |
+| Private cluster | `aks_clusters.<key>.private_cluster_enabled` | `true` (required, validated) |
+| Public FQDN disabled | `aks_clusters.<key>.private_cluster_public_fqdn_enabled` | `false` (required, validated) |
+| Public network access | `aks_clusters.<key>.public_network_access_enabled` | `false` (required, validated) |
 | Private DNS zone | `aks_clusters.<key>.private_dns_zone_id` | Resource ID or `null` |
 | Auto-upgrade channel | `aks_clusters.<key>.automatic_upgrade_channel` | `"none"`, `"patch"`, `"rapid"`, `"stable"` (default), `"node-image"` |
 | Per-cluster tags | `aks_clusters.<key>.tags` | `map(string)` |
@@ -134,7 +136,9 @@ All other node pool settings (autoscaling, zones, max_pods, disk, labels, taints
 
 ## Enforced Policies
 
-- **Private cluster**: `private_cluster_enabled` defaults to `true`. All clusters are private by default.
+- **Private cluster**: `private_cluster_enabled` must be `true`. Validated at plan time; setting it to `false` is rejected.
+- **No public FQDN**: `private_cluster_public_fqdn_enabled` must be `false`. Even on private clusters, Azure can expose a public FQDN — this is blocked.
+- **No public API access**: `public_network_access_enabled` must be `false`. The API server only accepts connections from private networks.
 - **RBAC required**: `role_based_access_control_enabled` must be `true`. Validated at plan time; setting it to `false` is rejected.
 - **Network policy**: `network_profile.network_policy` defaults to `"calico"`. Every cluster gets a network policy enforced.
 - **System-assigned identity**: `identity.type` defaults to `"SystemAssigned"`. All clusters use managed identity by default.

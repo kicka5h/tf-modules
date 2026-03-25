@@ -91,6 +91,38 @@ variable "storage_accounts" {
     ])
     error_message = "All storage accounts must enforce HTTPS only (enable_https_traffic_only = true)."
   }
+
+  validation {
+    condition = alltrue([
+      for k, sa in var.storage_accounts :
+      sa.public_network_access_enabled == false
+    ])
+    error_message = "All storage accounts must have public network access disabled (public_network_access_enabled = false)."
+  }
+
+  validation {
+    condition = alltrue([
+      for k, sa in var.storage_accounts :
+      sa.shared_access_key_enabled == false
+    ])
+    error_message = "All storage accounts must have shared access key disabled (shared_access_key_enabled = false). Use Azure AD authentication."
+  }
+
+  validation {
+    condition = alltrue([
+      for k, sa in var.storage_accounts :
+      sa.allow_nested_items_to_be_public == false
+    ])
+    error_message = "All storage accounts must have public blob access disabled (allow_nested_items_to_be_public = false)."
+  }
+
+  validation {
+    condition = alltrue([
+      for k, sa in var.storage_accounts :
+      sa.infrastructure_encryption_enabled == true
+    ])
+    error_message = "All storage accounts must have infrastructure encryption enabled (infrastructure_encryption_enabled = true)."
+  }
 }
 
 variable "tags" {
