@@ -1,11 +1,12 @@
 # Reusable Terraform pipeline workflow.
 #
-# - PR: validate + plan + OPA policy check (no apply)
-# - Merge to main: plan + OPA policy check + apply (with approval for stage/prod)
+# - PR: validate + plan + OPA policy check + cost estimate (no apply)
+# - Merge to main: plan + OPA policy check + cost estimate + apply (with approval for stage/prod)
 # - Environment detected from changed files under environments/<env>/ or shared/
 # - Deletion OPA policies enforced only on stage and prod
 # - All other OPA policies enforced on every environment
 # - OPA policies are hosted centrally in the policies repo
+# - Infracost estimates cost impact on every plan and posts a summary to the PR
 #
 # Expected caller repo structure:
 #   shared/              <- Terraform code (modules, resources, providers)
@@ -53,6 +54,11 @@ on:
         required: false
         type: string
         default: "main"
+      cost_threshold_monthly:
+        description: "Monthly cost increase threshold (USD) that triggers a warning. Set to 0 to disable."
+        required: false
+        type: number
+        default: 500
     secrets:
       ARM_CLIENT_ID:
         required: true
@@ -62,6 +68,8 @@ on:
         required: true
       ARM_TENANT_ID:
         required: true
+      INFRACOST_API_KEY:
+        required: false
 
 jobs:
   detect-environments:
@@ -234,6 +242,93 @@ jobs:
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           terraform show tfplan -no-color | head -100 >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      # ---------------------------------------------------------------
+      # Cost Estimation (Infracost)
+      # ---------------------------------------------------------------
+
+      - name: Setup Infracost
+        if: secrets.INFRACOST_API_KEY != ''
+        uses: infracost/actions/setup@v3
+        with:
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
+
+      - name: Generate cost baseline (base branch)
+        if: github.event_name == 'pull_request' && secrets.INFRACOST_API_KEY != ''
+        working-directory: ${{ inputs.shared_directory }}
+        run: |
+          # Generate baseline from the current plan (existing infrastructure)
+          infracost breakdown \
+            --path=. \
+            --format=json \
+            --out-file=/tmp/infracost-base-${{ matrix.environment }}.json
+
+      - name: Generate cost diff
+        if: secrets.INFRACOST_API_KEY != ''
+        working-directory: ${{ inputs.shared_directory }}
+        run: |
+          # Generate cost estimate from the plan file
+          infracost diff \
+            --path=tfplan.json \
+            --format=json \
+            --out-file=/tmp/infracost-${{ matrix.environment }}.json || true
+
+          # Also generate a human-readable table for the summary
+          infracost diff \
+            --path=tfplan.json \
+            --format=table \
+            --out-file=/tmp/infracost-${{ matrix.environment }}.txt || true
+
+      - name: Post cost estimate to PR
+        if: github.event_name == 'pull_request' && secrets.INFRACOST_API_KEY != ''
+        run: |
+          infracost comment github \
+            --path="/tmp/infracost-${{ matrix.environment }}.json" \
+            --repo=${{ github.repository }} \
+            --pull-request=${{ github.event.pull_request.number }} \
+            --github-token=${{ github.token }} \
+            --behavior=update \
+            --tag="infracost-${{ matrix.environment }}" || true
+
+      - name: Cost estimate summary
+        if: secrets.INFRACOST_API_KEY != ''
+        working-directory: ${{ inputs.shared_directory }}
+        run: |
+          COST_FILE="/tmp/infracost-${{ matrix.environment }}.json"
+          if [ ! -f "$COST_FILE" ]; then
+            echo "No cost estimate available."
+            exit 0
+          fi
+
+          # Extract cost diff
+          DIFF=$(cat "$COST_FILE" | jq -r '.diffTotalMonthlyCost // "0"')
+          TOTAL=$(cat "$COST_FILE" | jq -r '.totalMonthlyCost // "0"')
+
+          echo "## Cost Estimate: ${{ matrix.environment }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Metric | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| --- | --- |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Monthly cost change | \$$DIFF |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Total monthly cost | \$$TOTAL |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          # Show detailed breakdown
+          if [ -f "/tmp/infracost-${{ matrix.environment }}.txt" ]; then
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            cat "/tmp/infracost-${{ matrix.environment }}.txt" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          # Warn if cost increase exceeds threshold
+          THRESHOLD=${{ inputs.cost_threshold_monthly }}
+          if [ "$THRESHOLD" -gt 0 ] 2>/dev/null; then
+            DIFF_NUM=$(echo "$DIFF" | tr -d '-')
+            if [ "$(echo "$DIFF_NUM > $THRESHOLD" | bc -l 2>/dev/null)" = "1" ]; then
+              echo "" >> "$GITHUB_STEP_SUMMARY"
+              echo "> **Warning:** Monthly cost change (\$$DIFF) exceeds threshold (\$$THRESHOLD). Review required." >> "$GITHUB_STEP_SUMMARY"
+              echo "::warning::Cost increase of \$$DIFF/month exceeds threshold of \$$THRESHOLD/month for ${{ matrix.environment }}"
+            fi
+          fi
 
   deploy-dev:
     name: "Deploy (dev)"

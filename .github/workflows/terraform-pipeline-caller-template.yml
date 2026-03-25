@@ -30,15 +30,17 @@
 # directory needed in this repo.
 #
 # Behavior:
-#   - PR:            validate + plan + OPA check (no apply)
-#   - Merge to main: validate + plan + OPA check + apply
+#   - PR:            validate + plan + OPA check + cost estimate (no apply)
+#   - Merge to main: validate + plan + OPA check + cost estimate + apply
 #   - dev/qa:        auto-deploy, deletion policies skipped
 #   - stage:         requires approval, all policies enforced
 #   - prod:          requires approval, all policies enforced
+#   - Cost estimate: posts Infracost diff to PR, warns if change exceeds threshold
 #
 # Prerequisites:
 #   - GitHub environments "stage" and "prod" with required reviewers
 #   - ARM_* secrets at repo or environment level
+#   - INFRACOST_API_KEY secret (get from https://www.infracost.io/)
 #   - Policies repo accessible to this workflow
 
 name: Terraform
@@ -64,8 +66,10 @@ jobs:
       terraform_version: "1.9.0"
       policies_repo: "<org>/<repo>"
       policies_ref: "main"
+      cost_threshold_monthly: 500  # warn if monthly cost change exceeds $500
     secrets:
       ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
       ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
       ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
       ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+      INFRACOST_API_KEY: ${{ secrets.INFRACOST_API_KEY }}

@@ -93,6 +93,7 @@ Set these secrets at the GitHub organization level so all repos inherit them:
 | `ARM_SUBSCRIPTION_ID` | Target Azure subscription |
 | `ARM_TENANT_ID` | Azure AD tenant |
 | `LOCALSTACK_AUTH_TOKEN` | LocalStack token for integration tests |
+| `INFRACOST_API_KEY` | Infracost API key for cost estimation (free at [infracost.io](https://www.infracost.io/)) |
 
 For multi-subscription setups, use GitHub environment-level secrets instead (different credentials per dev/qa/stage/prod).
 
@@ -467,8 +468,44 @@ A reusable CI/CD workflow at `.github/workflows/terraform-pipeline.yml`.
 
 | Trigger | What runs | Deploys? |
 | --- | --- | --- |
-| PR opened/updated | validate + plan + OPA check | No |
-| PR merged to main | validate + plan + OPA check + apply | Yes |
+| PR opened/updated | validate + plan + OPA check + cost estimate | No |
+| PR merged to main | validate + plan + OPA check + cost estimate + apply | Yes |
+
+### Cost Estimation (Infracost)
+
+Every plan generates a cost estimate using [Infracost](https://www.infracost.io/). The pipeline estimates the monthly cost impact of every infrastructure change before it's applied.
+
+#### How it works
+
+| Step | When it runs | What it does |
+| --- | --- | --- |
+| Setup Infracost | Every plan (if API key set) | Installs the Infracost CLI |
+| Generate cost baseline | PR only | Creates a baseline cost snapshot from current infrastructure |
+| Generate cost diff | Every plan | Compares the Terraform plan against the baseline, outputs JSON + table |
+| Post to PR | PR only | Posts or updates a cost diff comment on the PR (one per environment) |
+| Cost summary | Every plan | Adds a cost table to the GitHub Actions step summary |
+| Threshold check | Every plan | Warns if monthly cost increase exceeds the configured threshold |
+
+#### What the PR comment shows
+
+- Monthly cost **before** and **after** the change
+- **Per-resource** cost breakdown (which resources got more or less expensive)
+- **Net monthly cost difference** across all resources in the plan
+- Each environment gets its own tagged comment (updated in place on subsequent pushes)
+
+#### Threshold warnings
+
+If the monthly cost change exceeds `cost_threshold_monthly`, the pipeline emits a `::warning` annotation visible in the PR checks tab. This does not block the pipeline — it's informational. To block on cost, add a separate approval gate.
+
+| Input | Default | Description |
+| --- | --- | --- |
+| `cost_threshold_monthly` | `500` | Monthly cost increase (USD) that triggers a warning. Set to `0` to disable. |
+
+#### Graceful degradation
+
+If `INFRACOST_API_KEY` is not configured, all cost estimation steps are skipped. The pipeline still runs validate, plan, OPA checks, and deploy as normal. Cost estimation is opt-in — add the secret to enable it.
+
+**Required secret:** `INFRACOST_API_KEY` — get a free key from [infracost.io](https://www.infracost.io/).
 
 ### Change Detection
 
