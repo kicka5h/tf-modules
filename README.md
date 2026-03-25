@@ -282,10 +282,27 @@ These cannot be bypassed without modifying the module source:
 
 Enforced by the Terraform pipeline workflow at plan time:
 
+**Deletion protection:**
+
 | Policy | dev/qa | stage/prod |
 | --- | --- | --- |
 | Resource deletion protection | Skipped | Enforced |
 | Resource replacement protection | Skipped | Enforced |
+
+**Cost optimization (environment-aware):**
+
+| Policy | What it restricts | dev/qa | stage/prod |
+| --- | --- | --- | --- |
+| `cost_vm_size` | VM sizes limited to B-series, D2, D4, E2, F2, F4 | Enforced | No limit |
+| `cost_storage_redundancy` | Storage replication limited to LRS/ZRS (no GRS/GZRS) | Enforced | No limit |
+| `cost_premium_sku` | Rejects Premium tier on Firewall, App Service, AKS, Front Door, App Gateway | Enforced | No limit |
+| `cost_aks_scaling` | AKS node pool max_count capped at 10 | Enforced | Capped at 100 |
+| `cost_public_ip` | All public IP creation blocked | Enforced | No limit |
+| `cost_disk_type` | Rejects Premium_LRS and UltraSSD_LRS disks | Enforced | No limit |
+| `cost_expressroute_sku` | Rejects Premium tier and UnlimitedData | Enforced | No limit |
+| `cost_vpn_sku` | VPN Gateway limited to Basic through VpnGw2AZ | Enforced | No limit |
+
+Cost policies detect environment from `input.variables.environment.value` or resource tags. They only restrict non-production environments — production can use any SKU or size.
 
 ### Priority reservations
 
