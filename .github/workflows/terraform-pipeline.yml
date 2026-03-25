@@ -1,0 +1,402 @@
+# Reusable Terraform pipeline workflow.
+#
+# - PR: validate + plan + OPA policy check (no apply)
+# - Merge to main: plan + OPA policy check + apply (with approval for stage/prod)
+# - Environment detected from changed files under environments/<env>/ or shared/
+# - Deletion OPA policies enforced only on stage and prod
+# - All other OPA policies enforced on every environment
+# - OPA policies are hosted centrally in the policies repo
+#
+# Expected caller repo structure:
+#   shared/              <- Terraform code (modules, resources, providers)
+#   environments/
+#     dev/
+#       backend.tf       <- remote state config
+#       dev.tfvars       <- environment-specific variables
+#     qa/
+#       backend.tf
+#       qa.tfvars
+#     stage/
+#       backend.tf
+#       stage.tfvars
+#     prod/
+#       backend.tf
+#       prod.tfvars
+
+name: Terraform Pipeline
+
+on:
+  workflow_call:
+    inputs:
+      shared_directory:
+        description: "Directory containing the shared Terraform code"
+        required: false
+        type: string
+        default: "shared"
+      environments_directory:
+        description: "Base directory containing environment subdirectories"
+        required: false
+        type: string
+        default: "environments"
+      terraform_version:
+        description: "Terraform version to use"
+        required: false
+        type: string
+        default: "latest"
+      policies_repo:
+        description: "Repository containing centralized OPA policies (owner/repo format)"
+        required: false
+        type: string
+        default: "<org>/<repo>"
+      policies_ref:
+        description: "Git ref for the policies repo"
+        required: false
+        type: string
+        default: "main"
+    secrets:
+      ARM_CLIENT_ID:
+        required: true
+      ARM_CLIENT_SECRET:
+        required: true
+      ARM_SUBSCRIPTION_ID:
+        required: true
+      ARM_TENANT_ID:
+        required: true
+
+jobs:
+  detect-environments:
+    name: Detect changed environments
+    runs-on: ubuntu-latest
+    outputs:
+      environments: ${{ steps.detect.outputs.environments }}
+      has_changes: ${{ steps.detect.outputs.has_changes }}
+    steps:
+      - name: Checkout caller repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed environments
+        id: detect
+        run: |
+          ENV_DIR="${{ inputs.environments_directory }}"
+          SHARED_DIR="${{ inputs.shared_directory }}"
+
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            CHANGED_FILES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD)
+          else
+            CHANGED_FILES=$(git diff --name-only HEAD~1...HEAD)
+          fi
+
+          # If shared/ changed, ALL environments are affected
+          SHARED_CHANGED=false
+          if echo "$CHANGED_FILES" | grep -q "^${SHARED_DIR}/"; then
+            SHARED_CHANGED=true
+          fi
+
+          ENVS=()
+          for DIR in "$ENV_DIR"/*/; do
+            ENV_NAME=$(basename "$DIR")
+            if [ "$SHARED_CHANGED" = "true" ]; then
+              ENVS+=("$ENV_NAME")
+            elif echo "$CHANGED_FILES" | grep -q "^${ENV_DIR}/${ENV_NAME}/"; then
+              ENVS+=("$ENV_NAME")
+            fi
+          done
+
+          if [ ${#ENVS[@]} -eq 0 ]; then
+            echo "No environment changes detected."
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            echo 'environments=[]' >> "$GITHUB_OUTPUT"
+          else
+            JSON=$(printf '%s\n' "${ENVS[@]}" | jq -R . | jq -sc .)
+            echo "Detected environments: $JSON"
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+            echo "environments=$JSON" >> "$GITHUB_OUTPUT"
+          fi
+
+  validate:
+    name: "Validate (${{ matrix.environment }})"
+    needs: detect-environments
+    if: needs.detect-environments.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: ${{ fromJson(needs.detect-environments.outputs.environments) }}
+    env:
+      ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+      ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+    steps:
+      - name: Checkout caller repo
+        uses: actions/checkout@v4
+
+      - name: Checkout centralized policies
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.policies_repo }}
+          ref: ${{ inputs.policies_ref }}
+          path: _policies_repo
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+
+      - name: Setup OPA
+        uses: open-policy-agent/setup-opa@v2
+
+      - name: Prepare working directory
+        run: |
+          WORK_DIR="${{ inputs.shared_directory }}"
+          ENV_DIR="${{ inputs.environments_directory }}/${{ matrix.environment }}"
+
+          # Copy environment backend config into the shared directory
+          if [ -f "$ENV_DIR/backend.tf" ]; then
+            cp "$ENV_DIR/backend.tf" "$WORK_DIR/backend.tf"
+          fi
+
+      - name: Terraform Init
+        working-directory: ${{ inputs.shared_directory }}
+        run: terraform init
+
+      - name: Terraform Validate
+        working-directory: ${{ inputs.shared_directory }}
+        run: terraform validate
+
+      - name: Terraform Format Check
+        run: |
+          terraform fmt -check -recursive "${{ inputs.shared_directory }}"
+          terraform fmt -check -recursive "${{ inputs.environments_directory }}"
+
+      - name: Terraform Plan
+        working-directory: ${{ inputs.shared_directory }}
+        run: |
+          ENV_DIR="${{ github.workspace }}/${{ inputs.environments_directory }}/${{ matrix.environment }}"
+          TFVARS=$(find "$ENV_DIR" -name "*.tfvars" -o -name "*.tfvars.json" | head -20)
+
+          VAR_FILE_ARGS=""
+          for f in $TFVARS; do
+            VAR_FILE_ARGS="$VAR_FILE_ARGS -var-file=$f"
+          done
+
+          terraform plan $VAR_FILE_ARGS -out=tfplan
+          terraform show -json tfplan > tfplan.json
+
+      - name: OPA Policy Check
+        working-directory: ${{ inputs.shared_directory }}
+        run: |
+          POLICY_DIR="${{ github.workspace }}/_policies_repo/policies"
+          if [ ! -d "$POLICY_DIR" ]; then
+            echo "No policies directory found at $POLICY_DIR, skipping."
+            exit 0
+          fi
+
+          echo "Running OPA policies from $POLICY_DIR..."
+          RESULT=$(opa eval \
+            -i tfplan.json \
+            -d "$POLICY_DIR" \
+            --format pretty \
+            "data.terraform[pkg].deny[x]" 2>&1) || true
+
+          # No results means no violations
+          if [ -z "$RESULT" ] || [ "$RESULT" = "undefined" ] || [ "$RESULT" = "{}" ]; then
+            echo "All policy checks passed."
+            exit 0
+          fi
+
+          # Filter deletion policies for dev and qa
+          ENV="${{ matrix.environment }}"
+          if [ "$ENV" = "dev" ] || [ "$ENV" = "qa" ]; then
+            echo "Environment: $ENV — skipping deletion policy enforcement"
+            FILTERED=$(echo "$RESULT" | grep -vi "deletion\|replacement" || true)
+            if [ -n "$FILTERED" ] && [ "$FILTERED" != "undefined" ]; then
+              echo "Policy violations found:"
+              echo "$FILTERED"
+              exit 1
+            fi
+            echo "All policy checks passed (deletion policies skipped)."
+          else
+            echo "Environment: $ENV — enforcing ALL policies including deletion protection"
+            echo "Policy violations found:"
+            echo "$RESULT"
+            exit 1
+          fi
+
+      - name: Post plan summary
+        if: github.event_name == 'pull_request'
+        working-directory: ${{ inputs.shared_directory }}
+        run: |
+          echo "## Terraform Plan: ${{ matrix.environment }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          terraform show tfplan -no-color | head -100 >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+  deploy-dev:
+    name: "Deploy (dev)"
+    needs: [detect-environments, validate]
+    if: |
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      contains(fromJson(needs.detect-environments.outputs.environments), 'dev')
+    runs-on: ubuntu-latest
+    env:
+      ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+      ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+
+      - name: Prepare and init
+        run: |
+          ENV_DIR="${{ inputs.environments_directory }}/dev"
+          WORK_DIR="${{ inputs.shared_directory }}"
+          [ -f "$ENV_DIR/backend.tf" ] && cp "$ENV_DIR/backend.tf" "$WORK_DIR/backend.tf"
+          cd "$WORK_DIR" && terraform init
+
+      - name: Terraform Apply
+        working-directory: ${{ inputs.shared_directory }}
+        run: |
+          ENV_DIR="${{ github.workspace }}/${{ inputs.environments_directory }}/dev"
+          TFVARS=$(find "$ENV_DIR" -name "*.tfvars" -o -name "*.tfvars.json" | head -20)
+          VAR_FILE_ARGS=""
+          for f in $TFVARS; do VAR_FILE_ARGS="$VAR_FILE_ARGS -var-file=$f"; done
+          terraform apply $VAR_FILE_ARGS -auto-approve
+
+  deploy-qa:
+    name: "Deploy (qa)"
+    needs: [detect-environments, validate]
+    if: |
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      contains(fromJson(needs.detect-environments.outputs.environments), 'qa')
+    runs-on: ubuntu-latest
+    env:
+      ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+      ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+
+      - name: Prepare and init
+        run: |
+          ENV_DIR="${{ inputs.environments_directory }}/qa"
+          WORK_DIR="${{ inputs.shared_directory }}"
+          [ -f "$ENV_DIR/backend.tf" ] && cp "$ENV_DIR/backend.tf" "$WORK_DIR/backend.tf"
+          cd "$WORK_DIR" && terraform init
+
+      - name: Terraform Apply
+        working-directory: ${{ inputs.shared_directory }}
+        run: |
+          ENV_DIR="${{ github.workspace }}/${{ inputs.environments_directory }}/qa"
+          TFVARS=$(find "$ENV_DIR" -name "*.tfvars" -o -name "*.tfvars.json" | head -20)
+          VAR_FILE_ARGS=""
+          for f in $TFVARS; do VAR_FILE_ARGS="$VAR_FILE_ARGS -var-file=$f"; done
+          terraform apply $VAR_FILE_ARGS -auto-approve
+
+  deploy-stage:
+    name: "Deploy (stage)"
+    needs: [detect-environments, validate, deploy-qa]
+    if: |
+      always() &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      contains(fromJson(needs.detect-environments.outputs.environments), 'stage') &&
+      (needs.deploy-qa.result == 'success' || needs.deploy-qa.result == 'skipped')
+    runs-on: ubuntu-latest
+    environment: stage
+    env:
+      ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+      ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+
+      - name: Prepare and init
+        run: |
+          ENV_DIR="${{ inputs.environments_directory }}/stage"
+          WORK_DIR="${{ inputs.shared_directory }}"
+          [ -f "$ENV_DIR/backend.tf" ] && cp "$ENV_DIR/backend.tf" "$WORK_DIR/backend.tf"
+          cd "$WORK_DIR" && terraform init
+
+      - name: Terraform Plan
+        working-directory: ${{ inputs.shared_directory }}
+        run: |
+          ENV_DIR="${{ github.workspace }}/${{ inputs.environments_directory }}/stage"
+          TFVARS=$(find "$ENV_DIR" -name "*.tfvars" -o -name "*.tfvars.json" | head -20)
+          VAR_FILE_ARGS=""
+          for f in $TFVARS; do VAR_FILE_ARGS="$VAR_FILE_ARGS -var-file=$f"; done
+          terraform plan $VAR_FILE_ARGS -out=tfplan
+
+      - name: Terraform Apply
+        working-directory: ${{ inputs.shared_directory }}
+        run: terraform apply tfplan
+
+  deploy-prod:
+    name: "Deploy (prod)"
+    needs: [detect-environments, validate, deploy-stage]
+    if: |
+      always() &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      contains(fromJson(needs.detect-environments.outputs.environments), 'prod') &&
+      (needs.deploy-stage.result == 'success' || needs.deploy-stage.result == 'skipped')
+    runs-on: ubuntu-latest
+    environment: prod
+    env:
+      ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+      ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+
+      - name: Prepare and init
+        run: |
+          ENV_DIR="${{ inputs.environments_directory }}/prod"
+          WORK_DIR="${{ inputs.shared_directory }}"
+          [ -f "$ENV_DIR/backend.tf" ] && cp "$ENV_DIR/backend.tf" "$WORK_DIR/backend.tf"
+          cd "$WORK_DIR" && terraform init
+
+      - name: Terraform Plan
+        working-directory: ${{ inputs.shared_directory }}
+        run: |
+          ENV_DIR="${{ github.workspace }}/${{ inputs.environments_directory }}/prod"
+          TFVARS=$(find "$ENV_DIR" -name "*.tfvars" -o -name "*.tfvars.json" | head -20)
+          VAR_FILE_ARGS=""
+          for f in $TFVARS; do VAR_FILE_ARGS="$VAR_FILE_ARGS -var-file=$f"; done
+          terraform plan $VAR_FILE_ARGS -out=tfplan
+
+      - name: Terraform Apply
+        working-directory: ${{ inputs.shared_directory }}
+        run: terraform apply tfplan

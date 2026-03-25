@@ -1,0 +1,27 @@
+# TEMPLATE: Copy this file to your caller repo at .github/workflows/blocklist-refresh.yml
+# and update the values below.
+#
+# This workflow runs on a schedule to detect changes in external IP blocklists
+# (Spamhaus DROP/EDROP, custom org IP list) and triggers a Terraform deployment
+# to update Application Gateway WAF rules.
+
+name: Blocklist Refresh
+
+on:
+  schedule:
+    # Run every 6 hours
+    - cron: "0 */6 * * *"
+  workflow_dispatch: # Allow manual trigger
+
+jobs:
+  refresh:
+    uses: <org>/az-application-gateway/.github/workflows/blocklist-refresh.yml@main
+    with:
+      terraform_directory: "."  # Path to your Terraform root module
+      terraform_version: "1.9.0"
+      auto_apply: false  # Set to true for automatic deployment
+    secrets:
+      ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+      ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
