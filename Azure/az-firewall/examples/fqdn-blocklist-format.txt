@@ -1,0 +1,32 @@
+# Custom FQDN Blocklist Format
+# -----------------------------
+# This file is consumed by the az-firewall module from:
+#   https://raw.githubusercontent.com/<org>/blocked-hosts/main/fqdn-blocklist.txt
+#
+# Rules:
+#   - One fully qualified domain name per line
+#   - Lines starting with # are comments (ignored)
+#   - Blank lines are ignored
+#   - Wildcard prefixes (*.example.com) are supported by Azure Firewall
+#   - Do NOT include IP addresses — use the ip-blocklist.txt for the NSG module instead
+#
+# These FQDNs are combined with the Ultimate Hosts Blacklist and applied as
+# application deny rules (HTTP + HTTPS) on every firewall with an inline policy.
+#
+# Example entries:
+
+# Known phishing domains
+malicious-login.example.com
+*.phishing-site.net
+
+# Data exfiltration endpoints
+exfil.bad-actor.com
+*.shady-uploads.org
+
+# Malware distribution
+malware-cdn.example.com
+*.sketchy-downloads.net
+
+# Cryptomining pools
+pool.crypto-miner.com
+*.mining-proxy.io

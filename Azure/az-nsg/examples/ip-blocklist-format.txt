@@ -1,0 +1,28 @@
+# Custom IP Blocklist Format
+# --------------------------
+# This file is consumed by the az-nsg module from:
+#   https://raw.githubusercontent.com/<org>/blocked-hosts/main/ip-blocklist.txt
+#
+# Rules:
+#   - One CIDR or IP address per line
+#   - Lines starting with # are comments (ignored)
+#   - Blank lines are ignored
+#   - Both single IPs (1.2.3.4/32) and CIDR ranges (1.2.3.0/24) are supported
+#
+# These IPs are combined with Spamhaus DROP+EDROP and applied as
+# priority 100 deny rules (inbound + outbound) on every NSG created
+# by the module.
+#
+# Example entries:
+
+# Known malicious scanner
+198.51.100.0/24
+
+# Compromised hosting provider range
+203.0.113.0/24
+
+# Individual bad actor
+192.0.2.55/32
+
+# Botnet C2 range
+100.64.0.0/16
