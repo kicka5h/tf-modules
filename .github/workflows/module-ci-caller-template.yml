@@ -1,0 +1,29 @@
+# TEMPLATE: Copy this file to each module repo at .github/workflows/ci.yml
+#
+# This runs on every PR and push to main:
+#   1. terraform fmt check
+#   2. terraform validate + unit tests (mock_provider)
+#   3. Integration tests against LocalStack Azure (if tests/integration/ exists)
+#   4. OPA policy tests
+#
+# Prerequisites:
+#   - LOCALSTACK_AUTH_TOKEN secret (get from https://app.localstack.cloud)
+#   - Integration test files in tests/integration/ (provider.tf + main.tf)
+
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  ci:
+    uses: <org>/<repo>/.github/workflows/module-ci.yml@main
+    with:
+      terraform_version: "1.9.0"
+      localstack_image: "localstack/localstack-azure-alpha"
+      run_integration_tests: true
+    secrets:
+      LOCALSTACK_AUTH_TOKEN: ${{ secrets.LOCALSTACK_AUTH_TOKEN }}

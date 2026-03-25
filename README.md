@@ -1,35 +1,356 @@
 # tf-modules
-Consumable modules for Terraform. No wrappers. All utility.
+
+Consumable Terraform modules for Azure. No wrappers. All utility.
+
+## Organization Setup Guide
+
+This section explains how to implement these modules across a GitHub organization. The architecture uses three types of repos: this module repo, a blocked-hosts repo, and caller repos.
+
+### Repo Architecture
+
+```
+github.com/<org>/
+├── tf-modules/                    # THIS REPO
+│   ├── Azure/                     # module source code (also split into individual repos)
+│   │   ├── az-virtual-network/
+│   │   ├── az-nsg/
+│   │   ├── az-storage-account/
+│   │   └── ...
+│   ├── policies/                  # centralized OPA policies (single source of truth)
+│   ├── scripts/                   # integration test runner
+│   └── .github/workflows/         # reusable workflows
+│       ├── terraform-pipeline.yml        # caller repo CI/CD
+│       ├── module-ci.yml                 # module repo CI
+│       └── blocklist-refresh.yml         # scheduled blocklist updates (per-module)
+│
+├── blocked-hosts/                 # CUSTOM BLOCKLISTS
+│   ├── ip-blocklist.txt           # one CIDR per line
+│   └── fqdn-blocklist.txt         # one domain per line
+│
+├── az-virtual-network/            # INDIVIDUAL MODULE REPOS (optional)
+├── az-nsg/                        # mirrors Azure/<module> from tf-modules
+├── az-storage-account/
+├── ...
+│
+├── infra-networking/              # CALLER REPO (example)
+│   ├── shared/                    # Terraform code
+│   │   └── main.tf
+│   ├── environments/
+│   │   ├── dev/
+│   │   ├── qa/
+│   │   ├── stage/
+│   │   └── prod/
+│   └── .github/workflows/
+│       ├── terraform.yml
+│       └── blocklist-refresh.yml
+│
+└── infra-compute/                 # CALLER REPO (example)
+    ├── shared/
+    ├── environments/
+    └── .github/workflows/
+```
+
+### Step 1: Create the tf-modules repo
+
+This repo. Contains all module source code, OPA policies, and reusable workflows.
+
+### Step 2: Create the blocked-hosts repo
+
+Create `<org>/blocked-hosts` with two files at the root:
+
+**`ip-blocklist.txt`** — custom IP CIDRs to block (one per line, `#` for comments):
+```
+# Known malicious scanner
+198.51.100.0/24
+# Compromised hosting range
+203.0.113.0/24
+```
+
+**`fqdn-blocklist.txt`** — custom domains to block (one per line, `#` for comments):
+```
+# Phishing domains
+malicious-login.example.com
+*.phishing-site.net
+```
+
+These are consumed automatically by `az-nsg`, `az-firewall`, `az-application-gateway`, and `az-front-door`. Update these files to push blocklist changes across all infrastructure.
+
+### Step 3: Split modules into individual repos (optional)
+
+If modules need independent versioning, mirror each `Azure/<module>/` into its own repo. Each module repo gets:
+- Module source code (root of repo)
+- `.github/workflows/ci.yml` — calls the reusable `module-ci.yml` workflow
+- Integration tests in `tests/integration/` run against LocalStack Azure
+
+### Step 4: Configure org-level secrets
+
+Set these secrets at the GitHub organization level so all repos inherit them:
+
+| Secret | Purpose |
+| --- | --- |
+| `ARM_CLIENT_ID` | Azure service principal for Terraform |
+| `ARM_CLIENT_SECRET` | Azure service principal secret |
+| `ARM_SUBSCRIPTION_ID` | Target Azure subscription |
+| `ARM_TENANT_ID` | Azure AD tenant |
+| `LOCALSTACK_AUTH_TOKEN` | LocalStack token for integration tests |
+
+For multi-subscription setups, use GitHub environment-level secrets instead (different credentials per dev/qa/stage/prod).
+
+### Step 5: Configure GitHub environments
+
+In each caller repo, create these GitHub environments:
+
+| Environment | Required reviewers | Purpose |
+| --- | --- | --- |
+| `stage` | At least 1 reviewer | Approval gate before stage deployment |
+| `prod` | At least 2 reviewers | Approval gate before prod deployment |
+
+`dev` and `qa` deploy automatically on merge — no environment protection needed.
+
+### Step 6: Create caller repos
+
+Each caller repo deploys a logical group of infrastructure (e.g., networking, compute, data platform). Structure:
+
+```
+infra-networking/
+├── shared/
+│   ├── main.tf               # module calls
+│   ├── variables.tf           # variable declarations
+│   └── providers.tf           # provider config (azurerm)
+├── environments/
+│   ├── dev/
+│   │   ├── backend.tf         # terraform { backend "azurerm" { ... } }
+│   │   └── dev.tfvars         # environment-specific values
+│   ├── qa/
+│   │   ├── backend.tf
+│   │   └── qa.tfvars
+│   ├── stage/
+│   │   ├── backend.tf
+│   │   └── stage.tfvars
+│   └── prod/
+│       ├── backend.tf
+│       └── prod.tfvars
+└── .github/workflows/
+    ├── terraform.yml           # copy from terraform-pipeline-caller-template.yml
+    └── blocklist-refresh.yml   # copy from blocklist-refresh-caller-template.yml (if using blocklist modules)
+```
+
+**`shared/main.tf`** example:
+```hcl
+module "vnet" {
+  source              = "git::https://github.com/<org>/tf-modules.git//Azure/az-virtual-network?ref=v1.0.0"
+  resource_group_name = var.resource_group_name
+  location            = var.location
+  vnets               = var.vnets
+  tags                = var.tags
+}
+
+module "nsg" {
+  source              = "git::https://github.com/<org>/tf-modules.git//Azure/az-nsg?ref=v1.0.0"
+  resource_group_name = var.resource_group_name
+  location            = var.location
+  nsgs                = var.nsgs
+  tags                = var.tags
+}
+```
+
+**`environments/dev/backend.tf`** example:
+```hcl
+terraform {
+  backend "azurerm" {
+    resource_group_name  = "rg-terraform-state"
+    storage_account_name = "stterraformdev"
+    container_name       = "tfstate"
+    key                  = "networking.tfstate"
+  }
+}
+```
+
+**`environments/dev/dev.tfvars`** example:
+```hcl
+resource_group_name = "rg-networking-dev"
+location            = "eastus2"
+
+vnets = {
+  hub = {
+    name          = "vnet-hub-dev"
+    address_space = ["10.0.0.0/16"]
+    subnets = {
+      default = { address_prefixes = ["10.0.1.0/24"] }
+    }
+  }
+}
+
+tags = {
+  environment = "dev"
+}
+```
+
+### Step 7: Set up blocklist refresh (caller repos using blocklist modules)
+
+Copy the blocklist refresh caller template to any caller repo that uses `az-nsg`, `az-firewall`, `az-application-gateway`, or `az-front-door`:
+
+```yaml
+# .github/workflows/blocklist-refresh.yml
+name: Blocklist Refresh
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+jobs:
+  refresh:
+    uses: <org>/<repo>/.github/workflows/blocklist-refresh.yml@main
+    with:
+      terraform_directory: "shared"
+      terraform_version: "1.9.0"
+      auto_apply: false
+    secrets:
+      ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+      ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+```
+
+## What Gets Enforced
+
+### Module-level enforcement (built into module code)
+
+These cannot be bypassed without modifying the module source:
+
+| Enforcement | Modules |
+| --- | --- |
+| Spamhaus DROP/EDROP IP blocklist | az-nsg, az-firewall, az-application-gateway, az-front-door |
+| Ultimate Hosts Blacklist FQDN blocklist | az-firewall, az-front-door |
+| Custom org IP/FQDN blocklists | az-nsg, az-firewall, az-application-gateway, az-front-door |
+| HTTPS only (validated) | az-storage-account, az-app-service |
+| TLS 1.2 minimum (validated) | az-storage-account, az-app-service |
+| Public network access disabled (validated) | az-storage-account, az-key-vault, az-container-registry, az-aks, az-app-service |
+| Private cluster required (validated) | az-aks |
+| No public FQDN on AKS (validated) | az-aks |
+| RBAC required (validated) | az-aks |
+| Admin user disabled (validated) | az-container-registry |
+| Purge protection required (validated) | az-key-vault |
+| FTP disabled (validated) | az-app-service |
+| Remote debugging disabled (validated) | az-app-service |
+| Private IP only (validated) | az-container-instance |
+| Trusted launch (default) | az-virtual-machine, az-vmss |
+| System-assigned managed identity (default) | az-virtual-machine, az-vmss, az-aks, az-container-instance, az-container-registry, az-key-vault, az-storage-account, az-app-service |
+| Default `Terraform = "true"` tag | All modules |
+| WAF policy with IP blocklist on WAF_v2 | az-application-gateway |
+| WAF policy with IP + FQDN blocklist on Premium | az-front-door |
+| Strong crypto required (validated) | az-vpn-gateway (rejects DES, DES3, MD5) |
+
+### Pipeline-level enforcement (via OPA policies)
+
+Enforced by the Terraform pipeline workflow at plan time:
+
+| Policy | dev/qa | stage/prod |
+| --- | --- | --- |
+| Resource deletion protection | Skipped | Enforced |
+| Resource replacement protection | Skipped | Enforced |
+
+### Priority reservations
+
+Modules that auto-generate rules reserve low-priority ranges:
+
+| Module | Reserved | Caller starts at |
+| --- | --- | --- |
+| `az-nsg` | 100-199 (blocklist rules) | 200 |
+| `az-firewall` | 100-299 (blocklist rule collection groups) | 300 |
+| `az-front-door` | 1-99 (WAF custom rules) | 100 |
+
+## Available Modules
+
+### Networking (13 modules)
+
+| Module | Resources |
+| --- | --- |
+| `az-dns-zone` | Public/private DNS zones, VNet links |
+| `az-virtual-network` | VNets, subnets, delegations, DDoS, encryption |
+| `az-route-table` | Route tables, routes, subnet associations |
+| `az-nsg` | NSGs, security rules, subnet associations, IP blocklist |
+| `az-public-ip` | Public IPs, IP prefixes |
+| `az-nat-gateway` | NAT gateways, PIP/prefix/subnet associations |
+| `az-firewall` | Firewalls, policies, rule collections, IP + FQDN blocklists |
+| `az-application-gateway` | App gateways, WAF policies with IP blocklist |
+| `az-load-balancer` | Load balancers, backend pools, probes, rules |
+| `az-private-endpoint` | Private endpoints with mandatory DNS zone groups |
+| `az-front-door` | Front Door profiles, endpoints, origins, routes, WAF with IP + FQDN blocklist |
+| `az-vpn-gateway` | VPN gateways, local gateways, connections, IPsec policies |
+| `az-expressroute` | ExpressRoute circuits, peerings |
+
+### Compute (5 modules)
+
+| Module | Resources |
+| --- | --- |
+| `az-virtual-machine` | Linux/Windows VMs, NICs, data disks |
+| `az-vmss` | Linux/Windows scale sets, rolling upgrades |
+| `az-aks` | AKS clusters, node pools |
+| `az-container-instance` | Container groups |
+| `az-container-registry` | Container registries, georeplications |
+
+### Storage (2 modules)
+
+| Module | Resources |
+| --- | --- |
+| `az-storage-account` | Storage accounts, containers, file shares, queues, tables |
+| `az-key-vault` | Key Vaults, access policies |
+
+### App Platform (1 module)
+
+| Module | Resources |
+| --- | --- |
+| `az-app-service` | Service plans, Linux/Windows web apps |
+
+## Resources Not Modularized
+
+The following Azure resources were intentionally skipped. A module should enforce meaningful policy, configuration standards, or security defaults. Resources that would just pass variables through to a single Terraform resource with no added value are better used directly.
+
+### Networking
+
+| Resource | Why skipped |
+| --- | --- |
+| VNet Peering | Single resource with a few booleans. No configuration to standardize — each peering is unique to the topology. |
+| Bastion Host | Single resource, SKU-specific fields. No policy value beyond what the caller sets. |
+| DDoS Protection Plan | One resource, one `name` field. The `az-virtual-network` module already accepts `ddos_protection_plan.id` as input. |
+| Network Watcher | Azure auto-creates one per region. A module adds no value over the auto-provisioned resource. |
+| Traffic Manager | Configuration varies too much per use case (geographic routing, performance, priority). No meaningful defaults to enforce. |
+| Private Link Service | Straightforward resource. Config is highly specific to each service being exposed. |
+
+### Compute
+
+| Resource | Why skipped |
+| --- | --- |
+| Availability Sets | Legacy construct, replaced by availability zones. All compute modules default to zone-redundant deployments. |
+| Proximity Placement Groups | Single resource with no security or configuration to enforce. |
+| Dedicated Hosts | Niche use case. Config is straightforward and host-specific. |
+| Batch Accounts | Niche workload type. No org-wide defaults to enforce. |
+
+### General
+
+| Resource | Why skipped |
+| --- | --- |
+| Resource Groups | Trivial single resource. Often created by other automation or landing zone tooling. |
+| User-Assigned Managed Identity | Single resource. All modules that need identity default to SystemAssigned. User-assigned identities are created directly when needed. |
+| Role Assignments | Highly specific to each workload. A module would just be a wrapper around `azurerm_role_assignment` with no added policy. |
+| Log Analytics Workspace | Single resource. Usually provisioned once per environment by a platform team, then referenced by ID. |
+| Monitor Diagnostic Settings | Attached per-resource with unique log categories. A module can't generalize this without becoming more complex than the resource itself. |
+
+### Database
+
+| Resource | Why skipped (for now) |
+| --- | --- |
+| Azure SQL Database | Good candidate for a future module (enforce TLS, private endpoints, backup policies, geo-redundancy). Not yet built. |
+| Cosmos DB | Good candidate for a future module (enforce consistency level, private endpoints, backup type). Not yet built. |
+| Redis Cache | Good candidate for a future module (enforce TLS, private endpoints, minimum SKU). Not yet built. |
+
+Database modules are the most likely next addition. The pattern would follow `az-storage-account` — enforce encryption, private network access, and backup policies via validation.
 
 ## Centralized OPA Policies
 
-All OPA policies are hosted centrally in this repo under `policies/`. Caller repos do NOT need their own copies — the Terraform pipeline workflow checks out this repo and evaluates policies automatically.
-
-```
-tf-modules/
-├── policies/                  # all OPA policies live here
-│   ├── deny_vm_deletion.rego
-│   ├── deny_vnet_deletion.rego
-│   ├── deny_storage_account_deletion.rego
-│   └── ...
-├── .github/workflows/
-│   ├── terraform-pipeline.yml            # reusable CI/CD pipeline
-│   ├── terraform-pipeline-caller-template.yml
-│   └── blocklist-refresh-caller-template.yml
-└── Azure/                     # modules (each also its own repo)
-```
-
-Each module also keeps a copy of its policy in its own `policies/` directory for reference, but the centralized `policies/` directory is the single source of truth used by the pipeline.
+All OPA policies are hosted in `policies/` in this repo. The Terraform pipeline automatically checks out and evaluates these policies — caller repos do not need their own copies.
 
 ### Writing Policies
-
-Policies evaluate against Terraform plan JSON output. Each policy file should:
-
-1. Define a `package` (e.g., `package terraform.dns`)
-2. Inspect `input.resource_changes` for the resource types the module manages
-3. Populate a `deny` set with error messages when a violation is found
-
-Example for the `az-dns-zone` module:
 
 ```rego
 package terraform.dns
@@ -51,201 +372,84 @@ deny contains msg if {
 
 ### Testing Policies
 
-Write OPA unit tests alongside each policy (e.g., `deny_zone_deletion_test.rego`) and run them with:
-
 ```bash
 opa test policies/ -v
 ```
 
-### CI/CD Integration
+## Terraform Pipeline
 
-Add a policy check step between `plan` and `apply` in your pipeline. Example GitHub Actions workflow:
+A reusable CI/CD workflow at `.github/workflows/terraform-pipeline.yml`.
 
-```yaml
-jobs:
-  terraform:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+### Pipeline Behavior
 
-      - uses: hashicorp/setup-terraform@v3
+| Trigger | What runs | Deploys? |
+| --- | --- | --- |
+| PR opened/updated | validate + plan + OPA check | No |
+| PR merged to main | validate + plan + OPA check + apply | Yes |
 
-      - name: Terraform Plan
-        run: |
-          terraform init
-          terraform plan -out=tfplan
-          terraform show -json tfplan > tfplan.json
+### Change Detection
 
-      - name: OPA Policy Check
-        uses: open-policy-agent/setup-opa@v2
-      - run: |
-          opa eval \
-            -i tfplan.json \
-            -d policies/ \
-            --fail-defined \
-            "data.terraform[_].deny[x]"
+- Changes to `shared/` trigger ALL environments
+- Changes to `environments/<env>/` trigger only that environment
 
-      - name: Terraform Apply
-        if: github.ref == 'refs/heads/main'
-        run: terraform apply tfplan
-```
+### Environment Deployment
 
-Alternatively, use [conftest](https://www.conftest.dev/) which is purpose-built for this:
-
-```bash
-conftest test tfplan.json -p policies/
-```
-
-### Per-Module Policy Checklist
-
-When consuming a new module, consider adding policies for:
-
-| Concern | Example |
-| --- | --- |
-| Prevent resource deletion | Block destroy of DNS zones, databases, storage accounts |
-| Prevent resource replacement | Block delete+create cycles on stateful resources |
-| Enforce tagging | Require specific tags on all resources |
-| Restrict configuration | Enforce SKU tiers, region constraints, naming conventions |
-
-Each module's directory in this repo may include a `policies/` folder with reference policies. Copy and adapt them to your caller repo as needed — they are not enforced from within the module.
+| Environment | Auto-deploy | Approval required | Deletion policies |
+| --- | --- | --- | --- |
+| dev | Yes | No | Skipped |
+| qa | Yes | No | Skipped |
+| stage | After qa | Yes | Enforced |
+| prod | After stage | Yes | Enforced |
 
 ## Blocklist Refresh Pipeline
 
-The following modules automatically fetch and enforce external IP and FQDN blocklists at `terraform plan` time:
+Modules with blocklists fetch external lists at `terraform plan` time. A scheduled workflow detects changes and triggers deployments.
 
-| Module | Spamhaus DROP/EDROP | Ultimate Hosts Blacklist | Custom org IP list | Custom org FQDN list |
+| Module | Spamhaus DROP/EDROP | Ultimate Hosts | Custom org IP | Custom org FQDN |
 | --- | --- | --- | --- | --- |
 | `az-nsg` | Yes | - | Yes | - |
 | `az-firewall` | Yes | Yes | Yes | Yes |
 | `az-application-gateway` | Yes | - | Yes | - |
 | `az-front-door` | Yes | Yes | Yes | Yes |
 
-These lists change over time. To keep your infrastructure up to date, set up a scheduled pipeline in your caller repo that periodically runs `terraform plan` and applies changes when the lists have updated.
+Each blocklist module includes its own workflow under `.github/workflows/`. Recommended schedule: every 6 hours.
 
-### Using the Reusable Workflow
+## Module CI (Integration Tests with LocalStack)
 
-This repo provides a reusable GitHub Actions workflow at `.github/workflows/blocklist-refresh.yml`. Add this to your caller repo:
+A reusable CI workflow at `.github/workflows/module-ci.yml` runs on every PR/push to module repos.
 
-```yaml
-# .github/workflows/blocklist-refresh.yml
-name: Blocklist Refresh
+| Job | What | Requires LocalStack |
+| --- | --- | --- |
+| Lint | `terraform fmt -check` | No |
+| Unit Tests | `terraform test` (mock_provider) | No |
+| Integration Tests | `terraform apply` + `destroy` against LocalStack Azure | Yes |
+| OPA Tests | `opa test policies/` | No |
 
-on:
-  schedule:
-    # Run every 6 hours
-    - cron: "0 */6 * * *"
-  workflow_dispatch:
+LocalStack Azure runs as a GitHub Actions service container. Integration tests live in `tests/integration/`.
 
-jobs:
-  refresh:
-    uses: <org>/tf-modules/.github/workflows/blocklist-refresh.yml@main
-    with:
-      terraform_directory: "."
-      terraform_version: "1.9.0"
-      auto_apply: false  # set to true for automatic deployment
-    secrets:
-      ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
-      ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
-      ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
-      ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+### Integration test provider config
+
+```hcl
+provider "azurerm" {
+  features {}
+  subscription_id                 = "00000000-0000-0000-0000-000000000000"
+  tenant_id                       = "00000000-0000-0000-0000-000000000000"
+  client_id                       = "00000000-0000-0000-0000-000000000000"
+  client_secret                   = "mock-secret"
+  metadata_host                   = "localhost.localstack.cloud:4566"
+  resource_provider_registrations = "none"
+}
 ```
 
-### How It Works
+### Running locally
 
-1. **Check phase**: Fetches each blocklist URL, computes a SHA-256 hash, and compares against cached hashes from the previous run
-2. **Deploy phase** (only if changes detected): Runs `terraform plan` to detect drift from updated lists, then optionally applies
-3. **Summary**: Reports which lists changed and whether changes were applied
+```bash
+# Start LocalStack Azure
+IMAGE_NAME=localstack/localstack-azure-alpha localstack start
 
-### Configuration
+# Run all integration tests
+./scripts/integration-test.sh
 
-| Input | Default | Description |
-| --- | --- | --- |
-| `terraform_directory` | (required) | Path to your Terraform root module |
-| `terraform_version` | `latest` | Terraform CLI version |
-| `auto_apply` | `false` | Set to `true` to apply automatically; `false` requires manual approval via GitHub environment protection rules |
-
-### Recommended Schedule
-
-| Environment | Frequency | `auto_apply` |
-| --- | --- | --- |
-| Production | Every 6 hours | `false` (manual approval) |
-| Staging | Every 6 hours | `true` |
-| Development | Daily | `true` |
-
-A full template is available at `.github/workflows/blocklist-refresh-caller-template.yml`.
-
-Each blocklist module also includes its own copy of the workflow under `<module>/.github/workflows/` since modules are intended to be used as separate repos.
-
-## Terraform Pipeline
-
-A reusable CI/CD workflow is provided at `.github/workflows/terraform-pipeline.yml` for caller repos that deploy infrastructure using these modules.
-
-### Expected Caller Repo Structure
-
+# Run a single module
+./scripts/integration-test.sh az-virtual-network
 ```
-caller-repo/
-├── shared/                    # Terraform code (written once)
-│   ├── main.tf
-│   ├── variables.tf
-│   └── providers.tf
-├── environments/
-│   ├── dev/
-│   │   ├── backend.tf        # remote state config
-│   │   └── dev.tfvars        # environment-specific values
-│   ├── qa/
-│   │   ├── backend.tf
-│   │   └── qa.tfvars
-│   ├── stage/
-│   │   ├── backend.tf
-│   │   └── stage.tfvars
-│   └── prod/
-│       ├── backend.tf
-│       └── prod.tfvars
-└── .github/workflows/
-    ├── terraform.yml          # calls the reusable pipeline
-    └── blocklist-refresh.yml  # scheduled blocklist updates
-```
-
-- `shared/` contains the actual Terraform code — module calls, resources, providers. Written once.
-- `environments/<env>/` contains only `backend.tf` (remote state) and `.tfvars` (variable values).
-- The pipeline copies `backend.tf` into `shared/` and passes `.tfvars` via `-var-file`.
-- OPA policies are hosted centrally in this repo — no `policies/` directory needed in caller repos.
-
-### Pipeline Behavior
-
-| Trigger | What runs | Deploys? |
-| --- | --- | --- |
-| PR opened/updated | validate + plan + OPA check on changed environments | No |
-| PR merged to main | validate + plan + OPA check + apply on changed environments | Yes |
-
-### Change Detection
-
-- Changes to `shared/` trigger ALL environments (since shared code affects everything)
-- Changes to `environments/<env>/` trigger only that environment
-
-### Environment Deployment
-
-| Environment | Auto-deploy | Approval required | Deletion policies enforced |
-| --- | --- | --- | --- |
-| dev | Yes | No | No |
-| qa | Yes | No | No |
-| stage | After qa succeeds | Yes (GitHub environment protection) | Yes |
-| prod | After stage succeeds | Yes (GitHub environment protection) | Yes |
-
-### OPA Policy Enforcement
-
-- **dev/qa**: All OPA policies run except deletion/replacement denials — this allows destroy+recreate workflows during development
-- **stage/prod**: ALL policies enforced including deletion protection — prevents accidental resource destruction
-
-### Usage
-
-Copy `.github/workflows/terraform-pipeline-caller-template.yml` to your caller repo and update:
-- `<org>/<repo>` to your actual org/repo for both `uses` and `policies_repo`
-- `terraform_version` to your version
-- `shared_directory` and `environments_directory` if not using the defaults
-
-### Prerequisites
-
-1. GitHub environments `stage` and `prod` configured with [required reviewers](https://docs.github.com/en/actions/deployment/targeting-different-environments/using-environments-for-deployment#required-reviewers)
-2. `ARM_CLIENT_ID`, `ARM_CLIENT_SECRET`, `ARM_SUBSCRIPTION_ID`, `ARM_TENANT_ID` secrets configured at the repo or environment level
-3. The policies repo (`tf-modules`) must be accessible to the caller repo's workflow (public, or use a PAT for private repos)

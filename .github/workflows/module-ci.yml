@@ -1,0 +1,159 @@
+# Reusable CI workflow for Terraform module repos.
+#
+# Runs on PRs and pushes to main:
+#   1. terraform fmt check
+#   2. terraform validate
+#   3. Unit tests (terraform test with mock_provider)
+#   4. Integration tests against LocalStack Azure (if tests/integration/ exists)
+#
+# Each module repo can call this workflow from its own .github/workflows/ci.yml.
+
+name: Module CI
+
+on:
+  workflow_call:
+    inputs:
+      terraform_version:
+        description: "Terraform version to use"
+        required: false
+        type: string
+        default: "latest"
+      localstack_image:
+        description: "LocalStack Docker image for integration tests"
+        required: false
+        type: string
+        default: "localstack/localstack-azure-alpha"
+      run_integration_tests:
+        description: "Whether to run integration tests against LocalStack"
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      LOCALSTACK_AUTH_TOKEN:
+        required: false
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive
+
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Run unit tests
+        run: |
+          if ls tests/*.tftest.hcl 1>/dev/null 2>&1; then
+            terraform test
+          else
+            echo "No unit test files found, skipping."
+          fi
+
+  integration-tests:
+    name: Integration Tests (LocalStack)
+    runs-on: ubuntu-latest
+    if: inputs.run_integration_tests
+    needs: unit-tests
+    services:
+      localstack:
+        image: ${{ inputs.localstack_image }}
+        ports:
+          - 4566:4566
+        env:
+          LOCALSTACK_AUTH_TOKEN: ${{ secrets.LOCALSTACK_AUTH_TOKEN }}
+        options: >-
+          --health-cmd "curl -sf https://localhost.localstack.cloud:4566/_localstack/health || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 30
+          --health-start-period 30s
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+
+      - name: Wait for LocalStack Azure
+        run: |
+          echo "Waiting for LocalStack Azure metadata endpoint..."
+          for i in $(seq 1 60); do
+            if curl -sfk "https://localhost.localstack.cloud:4566/metadata/endpoints?api-version=2024-05-01" > /dev/null 2>&1; then
+              echo "LocalStack Azure is ready."
+              exit 0
+            fi
+            echo "Attempt $i/60 - waiting..."
+            sleep 5
+          done
+          echo "LocalStack Azure failed to start."
+          exit 1
+
+      - name: Check for integration tests
+        id: check
+        run: |
+          if [ -d "tests/integration" ] && ls tests/integration/*.tf 1>/dev/null 2>&1; then
+            echo "has_tests=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_tests=false" >> "$GITHUB_OUTPUT"
+            echo "No integration test directory found, skipping."
+          fi
+
+      - name: Terraform Init (integration)
+        if: steps.check.outputs.has_tests == 'true'
+        working-directory: tests/integration
+        run: terraform init
+
+      - name: Terraform Apply (integration)
+        if: steps.check.outputs.has_tests == 'true'
+        working-directory: tests/integration
+        run: terraform apply -auto-approve -input=false
+
+      - name: Terraform Destroy (integration)
+        if: always() && steps.check.outputs.has_tests == 'true'
+        working-directory: tests/integration
+        run: terraform destroy -auto-approve -input=false
+
+  opa-tests:
+    name: OPA Policy Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup OPA
+        uses: open-policy-agent/setup-opa@v2
+
+      - name: Run OPA tests
+        run: |
+          if [ -d "policies" ] && ls policies/*.rego 1>/dev/null 2>&1; then
+            opa test policies/ -v
+          else
+            echo "No OPA policies found, skipping."
+          fi
