@@ -34,3 +34,4 @@ output "vnets" {
 output "subnets" {
   value = module.network.subnets
 }
+

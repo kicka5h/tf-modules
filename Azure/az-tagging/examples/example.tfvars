@@ -1,0 +1,5 @@
+environment         = "prod"
+owner               = "sre-team"
+cost_center         = "CC-5678"
+data_classification = "confidential"
+project             = "api-gateway"

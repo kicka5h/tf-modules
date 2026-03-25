@@ -50,3 +50,4 @@ output "blocklist_fqdn_count" {
 output "blocklist_ip_count" {
   value = module.firewalls.blocklist_ip_count
 }
+

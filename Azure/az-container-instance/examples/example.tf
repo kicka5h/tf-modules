@@ -28,3 +28,4 @@ module "container_instance" {
 output "container_groups" {
   value = module.container_instance.container_groups
 }
+

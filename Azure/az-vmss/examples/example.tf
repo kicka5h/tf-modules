@@ -28,3 +28,4 @@ module "vmss" {
 output "scale_sets" {
   value = module.vmss.scale_sets
 }
+

@@ -37,3 +37,4 @@ output "service_plans" {
 output "web_apps" {
   value = module.app_service.web_apps
 }
+

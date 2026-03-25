@@ -40,3 +40,4 @@ output "public_ips" {
 output "public_ip_prefixes" {
   value = module.public_ip.public_ip_prefixes
 }
+

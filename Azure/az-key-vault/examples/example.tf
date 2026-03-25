@@ -32,3 +32,4 @@ output "key_vaults" {
 output "access_policies" {
   value = module.key_vaults.access_policies
 }
+

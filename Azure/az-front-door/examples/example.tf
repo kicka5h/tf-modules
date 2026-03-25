@@ -51,3 +51,4 @@ output "blocklist_ip_count" {
 output "blocklist_fqdn_count" {
   value = module.front_doors.blocklist_fqdn_count
 }
+

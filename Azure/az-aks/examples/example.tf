@@ -33,3 +33,4 @@ output "aks_clusters" {
 output "additional_node_pools" {
   value = module.aks.additional_node_pools
 }
+

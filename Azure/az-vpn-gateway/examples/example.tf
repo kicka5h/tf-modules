@@ -36,3 +36,4 @@ output "local_network_gateways" {
 output "connections" {
   value = module.vpn_gateways.connections
 }
+

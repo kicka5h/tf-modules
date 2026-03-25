@@ -77,3 +77,52 @@ resource "azurerm_container_group" "this" {
     }
   }
 }
+
+# =================================================================
+# Optional: Internal utility module integration
+# Uncomment the blocks below to enable az-naming, az-tagging,
+# az-diagnostics, and az-budget within this module.
+# =================================================================
+
+# --- az-naming: generate compliant resource names ---
+# module "naming" {
+#   count   = var.naming_config != null ? 1 : 0
+#   source  = "github.com/<org>/tf-modules//Azure/az-naming"
+#
+#   environment = var.naming_config.environment
+#   region      = var.naming_config.region
+#   workload    = var.naming_config.workload
+# }
+
+# --- az-tagging: enforce standard tags ---
+# module "tagging" {
+#   count   = var.tagging_config != null ? 1 : 0
+#   source  = "github.com/<org>/tf-modules//Azure/az-tagging"
+#
+#   environment         = var.tagging_config.environment
+#   owner               = var.tagging_config.owner
+#   cost_center         = var.tagging_config.cost_center
+#   project             = var.tagging_config.project
+#   data_classification = var.tagging_config.data_classification
+# }
+
+# --- az-diagnostics: send container group metrics/logs to Log Analytics ---
+# module "diagnostics" {
+#   source   = "github.com/<org>/tf-modules//Azure/az-diagnostics"
+#   for_each = var.diagnostics_config != null ? azurerm_container_group.this : {}
+#
+#   target_resource_id         = each.value.id
+#   log_analytics_workspace_id = var.diagnostics_config.log_analytics_workspace_id
+#   storage_account_id         = var.diagnostics_config.storage_account_id
+# }
+
+# --- az-budget: apply budget controls ---
+# module "budget" {
+#   count  = var.budget_config != null ? 1 : 0
+#   source = "github.com/<org>/tf-modules//Azure/az-budget"
+#
+#   amount            = var.budget_config.amount
+#   resource_group_id = var.budget_config.resource_group_id
+#   start_date        = var.budget_config.start_date
+#   contact_emails    = var.budget_config.contact_emails
+# }

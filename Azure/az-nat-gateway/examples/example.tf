@@ -40,3 +40,4 @@ output "prefix_associations" {
 output "subnet_associations" {
   value = module.nat_gateways.subnet_associations
 }
+

@@ -36,3 +36,4 @@ output "routes" {
 output "subnet_associations" {
   value = module.route_tables.subnet_associations
 }
+

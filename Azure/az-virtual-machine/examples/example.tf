@@ -36,3 +36,4 @@ output "network_interfaces" {
 output "data_disks" {
   value = module.virtual_machines.data_disks
 }
+

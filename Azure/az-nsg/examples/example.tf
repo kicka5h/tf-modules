@@ -41,3 +41,4 @@ output "subnet_associations" {
 output "spamhaus_rules" {
   value = module.nsgs.spamhaus_rules
 }
+

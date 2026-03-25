@@ -33,3 +33,4 @@ output "expressroute_circuits" {
 output "peerings" {
   value = module.expressroute.peerings
 }
+

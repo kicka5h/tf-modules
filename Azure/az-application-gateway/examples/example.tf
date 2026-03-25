@@ -38,3 +38,4 @@ output "waf_policies" {
 output "blocklist_ip_count" {
   value = module.application_gateways.blocklist_ip_count
 }
+

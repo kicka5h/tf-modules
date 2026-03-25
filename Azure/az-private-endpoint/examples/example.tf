@@ -28,3 +28,4 @@ module "private_endpoints" {
 output "private_endpoints" {
   value = module.private_endpoints.private_endpoints
 }
+

@@ -48,3 +48,4 @@ output "nat_rules" {
 output "outbound_rules" {
   value = module.load_balancers.outbound_rules
 }
+

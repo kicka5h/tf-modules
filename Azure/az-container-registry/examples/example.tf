@@ -28,3 +28,4 @@ module "container_registries" {
 output "container_registries" {
   value = module.container_registries.container_registries
 }
+

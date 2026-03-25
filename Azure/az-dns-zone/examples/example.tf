@@ -34,3 +34,4 @@ output "private_dns_zones" {
 output "private_dns_zone_vnet_links" {
   value = module.dns.private_dns_zone_vnet_links
 }
+

@@ -45,3 +45,4 @@ output "queues" {
 output "tables" {
   value = module.storage_accounts.tables
 }
+
