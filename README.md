@@ -420,14 +420,59 @@ A reusable CI workflow at `.github/workflows/module-ci.yml` runs on every PR/pus
 
 | Job | What | Requires LocalStack |
 | --- | --- | --- |
-| Lint | `terraform fmt -check` | No |
-| Unit Tests | `terraform test` (mock_provider) | No |
-| Integration Tests | `terraform apply` + `destroy` against LocalStack Azure | Yes |
-| OPA Tests | `opa test policies/` | No |
+| Lint | `terraform fmt -check -recursive` | No |
+| Unit Tests | `terraform test` (mock_provider, plan-only) | No |
+| Integration Tests | `terraform test` (real provider, apply + destroy against LocalStack) | Yes |
+| OPA Tests | `opa test policies/ -v` | No |
 
-LocalStack Azure runs as a GitHub Actions service container. Integration tests live in `tests/integration/`.
+### Test file naming convention
+
+All tests live in the `tests/` directory. The filename prefix determines how they run:
+
+| Pattern | Type | Provider | Command | When it runs |
+| --- | --- | --- | --- | --- |
+| `tests/*.tftest.hcl` | Unit | `mock_provider "azurerm" {}` | `plan` | Always (no infra needed) |
+| `tests/integration_*.tftest.hcl` | Integration | Real `azurerm` pointing at LocalStack | `apply` | Only when LocalStack is running |
+
+The CI workflow automatically separates them — unit tests exclude `integration_*` files, integration tests only run `integration_*` files.
+
+### Test structure
+
+Each module with integration tests has:
+
+```
+az-virtual-network/
+├── tests/
+│   ├── vnets.tftest.hcl              # unit test (mock_provider, plan)
+│   ├── tags.tftest.hcl               # unit test
+│   ├── empty.tftest.hcl              # unit test
+│   ├── validation.tftest.hcl         # unit test
+│   ├── integration_vnet.tftest.hcl   # integration test (real provider, apply)
+│   └── setup/
+│       └── main.tf                   # creates resource group for integration tests
+└── ...
+```
+
+Integration tests use a two-step pattern:
+
+1. **Setup run**: creates the resource group via a helper module in `tests/setup/`
+2. **Apply run**: applies the module and asserts on the created resources
+
+Terraform's test framework handles cleanup automatically — resources are destroyed after the test completes.
+
+### Modules with integration tests
+
+| Module | Test file | What it applies |
+| --- | --- | --- |
+| `az-virtual-network` | `integration_vnet.tftest.hcl` | VNet + 2 subnets, validates tags |
+| `az-nsg` | `integration_nsg.tftest.hcl` | NSG + 2 user rules, validates priority and access |
+| `az-route-table` | `integration_route_table.tftest.hcl` | Route table + 2 routes, validates BGP and next hop |
+| `az-storage-account` | `integration_storage.tftest.hcl` | Storage account + containers + file share, validates TLS and replication |
+| `az-key-vault` | `integration_keyvault.tftest.hcl` | Key Vault, validates SKU, purge protection, RBAC, public access |
 
 ### Integration test provider config
+
+Every `integration_*.tftest.hcl` file includes this provider block targeting LocalStack:
 
 ```hcl
 provider "azurerm" {
@@ -441,15 +486,51 @@ provider "azurerm" {
 }
 ```
 
+### Adding integration tests to a new module
+
+1. Create `tests/setup/main.tf` with a resource group:
+    ```hcl
+    resource "azurerm_resource_group" "test" {
+      name     = "rg-<module>-inttest"
+      location = "eastus2"
+    }
+    ```
+
+2. Create `tests/integration_<name>.tftest.hcl` with:
+    - The LocalStack provider block (above)
+    - Variables for a minimal module invocation
+    - A `run "setup_resource_group"` block with `command = apply` and `module { source = "./tests/setup" }`
+    - A `run "apply_<name>_module"` block with `command = apply` and assertions
+
+3. The CI workflow picks it up automatically — no workflow changes needed.
+
 ### Running locally
 
 ```bash
 # Start LocalStack Azure
 IMAGE_NAME=localstack/localstack-azure-alpha localstack start
 
-# Run all integration tests
+# Run all tests (unit + integration) via terraform test
+cd Azure/az-virtual-network
+terraform init
+terraform test
+
+# Run only unit tests (no LocalStack needed)
+terraform test --filter=vnets
+terraform test --filter=tags
+
+# Run only integration tests (requires LocalStack)
+terraform test --filter=integration_vnet
+
+# Run all integration tests via the helper script
 ./scripts/integration-test.sh
 
-# Run a single module
+# Run a single module via the helper script
 ./scripts/integration-test.sh az-virtual-network
 ```
+
+### CI setup per module repo
+
+1. Copy `.github/workflows/module-ci-caller-template.yml` to the module repo as `.github/workflows/ci.yml`
+2. Add `LOCALSTACK_AUTH_TOKEN` as a repository secret (get from [app.localstack.cloud](https://app.localstack.cloud))
+3. The workflow automatically detects and runs both unit and integration tests

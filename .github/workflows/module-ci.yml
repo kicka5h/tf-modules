@@ -3,8 +3,9 @@
 # Runs on PRs and pushes to main:
 #   1. terraform fmt check
 #   2. terraform validate
-#   3. Unit tests (terraform test with mock_provider)
-#   4. Integration tests against LocalStack Azure (if tests/integration/ exists)
+#   3. Unit tests (terraform test with mock_provider — excludes integration_* files)
+#   4. Integration tests against LocalStack Azure (terraform test --filter=integration_*)
+#   5. OPA policy tests
 #
 # Each module repo can call this workflow from its own .github/workflows/ci.yml.
 
@@ -66,10 +67,14 @@ jobs:
       - name: Terraform Validate
         run: terraform validate
 
-      - name: Run unit tests
+      - name: Run unit tests (exclude integration)
         run: |
-          if ls tests/*.tftest.hcl 1>/dev/null 2>&1; then
-            terraform test
+          UNIT_TESTS=$(find tests -maxdepth 1 -name "*.tftest.hcl" ! -name "integration_*" 2>/dev/null)
+          if [ -n "$UNIT_TESTS" ]; then
+            for test_file in $UNIT_TESTS; do
+              echo "Running: $test_file"
+              terraform test --filter="$(basename "$test_file" .tftest.hcl)"
+            done
           else
             echo "No unit test files found, skipping."
           fi
@@ -118,27 +123,30 @@ jobs:
       - name: Check for integration tests
         id: check
         run: |
-          if [ -d "tests/integration" ] && ls tests/integration/*.tf 1>/dev/null 2>&1; then
+          INTEGRATION_TESTS=$(find tests -maxdepth 1 -name "integration_*.tftest.hcl" 2>/dev/null)
+          if [ -n "$INTEGRATION_TESTS" ]; then
             echo "has_tests=true" >> "$GITHUB_OUTPUT"
+            echo "Found integration tests:"
+            echo "$INTEGRATION_TESTS"
           else
             echo "has_tests=false" >> "$GITHUB_OUTPUT"
-            echo "No integration test directory found, skipping."
+            echo "No integration test files found (tests/integration_*.tftest.hcl), skipping."
           fi
 
-      - name: Terraform Init (integration)
+      - name: Terraform Init
         if: steps.check.outputs.has_tests == 'true'
-        working-directory: tests/integration
         run: terraform init
 
-      - name: Terraform Apply (integration)
+      - name: Run integration tests
         if: steps.check.outputs.has_tests == 'true'
-        working-directory: tests/integration
-        run: terraform apply -auto-approve -input=false
-
-      - name: Terraform Destroy (integration)
-        if: always() && steps.check.outputs.has_tests == 'true'
-        working-directory: tests/integration
-        run: terraform destroy -auto-approve -input=false
+        run: |
+          for test_file in tests/integration_*.tftest.hcl; do
+            TEST_NAME=$(basename "$test_file" .tftest.hcl)
+            echo "==========================================="
+            echo "Running: $TEST_NAME"
+            echo "==========================================="
+            terraform test --filter="$TEST_NAME"
+          done
 
   opa-tests:
     name: OPA Policy Tests
