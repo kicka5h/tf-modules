@@ -165,7 +165,7 @@ module "vnets" {
 }
 ```
 
-The caller never writes a CIDR — IPAM calculates all addresses. See `examples/full-stack/` for the complete implementation including NSGs, route tables, and auto-association.
+The caller never writes a CIDR — IPAM calculates all addresses. See `Azure/az-ipam/examples/full-stack/` for the complete implementation including NSGs, route tables, and auto-association.
 
 **`environments/dev/backend.tf`**:
 ```hcl
@@ -367,7 +367,7 @@ Modules that auto-generate rules reserve low-priority ranges:
 
 The IPAM module generates non-overlapping IP address spaces from a root CIDR block. A companion discovery script (`scripts/discover-ip-allocations.sh`) queries Azure Resource Graph for all existing VNets, subnets, and public IPs across the tenant. New allocations are validated against these reserved ranges to prevent conflicts.
 
-IPAM is designed to be consumed by other modules — the caller defines the shape of their network (VNet names, subnet names, sizes) and IPAM feeds calculated CIDRs into `az-virtual-network`, `az-nsg`, `az-route-table`, and any other module that needs addresses. The caller never writes a CIDR. See `examples/full-stack/` for a complete reference implementation.
+IPAM is designed to be consumed by other modules — the caller defines the shape of their network (VNet names, subnet names, sizes) and IPAM feeds calculated CIDRs into `az-virtual-network`, `az-nsg`, `az-route-table`, and any other module that needs addresses. The caller never writes a CIDR. See `Azure/az-ipam/examples/full-stack/` for a complete reference implementation.
 
 **How it flows:**
 
