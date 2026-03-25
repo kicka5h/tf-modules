@@ -1,0 +1,41 @@
+# TEMPLATE: Copy this file to your caller repo at .github/workflows/orphan-detection.yml
+#
+# Runs on a schedule to detect Azure resources that exist in the subscription
+# but are NOT managed by any Terraform state file (orphan resources).
+# When orphans are found, creates a GitHub issue with remediation steps.
+#
+# Prerequisites:
+#   - ARM_* secrets at repo or environment level
+#   - Labels "orphan", "infrastructure", "automated" created in the repo
+#   - Azure CLI resource graph extension available (installed automatically)
+#   - (Optional) Set issue_assignees to the on-call or platform team
+
+name: Orphan Resource Detection
+
+on:
+  schedule:
+    # Run weekly on Monday at 7 AM UTC
+    - cron: "0 7 * * 1"
+  workflow_dispatch:
+    inputs:
+      environments:
+        description: "JSON array of environments to check (leave empty for all)"
+        required: false
+        default: ""
+
+jobs:
+  orphans:
+    uses: <org>/<repo>/.github/workflows/orphan-detection.yml@main
+    with:
+      shared_directory: "shared"
+      environments_directory: "environments"
+      terraform_version: "1.9.0"
+      environments: ${{ github.event.inputs.environments || '' }}
+      create_issues: true
+      issue_assignees: ""  # e.g., "platform-lead,sre-oncall"
+      issue_labels: "orphan,infrastructure,automated"
+    secrets:
+      ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+      ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}

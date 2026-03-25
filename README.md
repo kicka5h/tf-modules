@@ -469,8 +469,21 @@ A reusable CI/CD workflow at `.github/workflows/terraform-pipeline.yml`.
 
 | Trigger | What runs | Deploys? |
 | --- | --- | --- |
-| PR opened/updated | validate + plan + OPA check + cost estimate | No |
-| PR merged to main | validate + plan + OPA check + cost estimate + apply | Yes |
+| PR opened/updated | version check + validate + plan + OPA check + cost estimate | No |
+| PR merged to main | version check + validate + plan + OPA check + cost estimate + apply | Yes |
+
+### Version Pinning Check
+
+Every pipeline run verifies Terraform and provider version pinning:
+
+| Check | Severity | What it catches |
+| --- | --- | --- |
+| Lock file missing | Error (blocks PR) | `.terraform.lock.hcl` not committed — provider versions float between runs |
+| No version constraint | Warning | Provider in `required_providers` has no `version` attribute |
+| Loose constraint | Warning | Provider uses `>= x.y.z` without an upper bound — major version bumps could break |
+| Terraform version | Info | Reports running version and any `required_version` constraint |
+
+In the validate job, a missing lock file fails the pipeline. In deploy jobs, all checks are warnings only.
 
 ### Cost Estimation (Infracost)
 
@@ -583,6 +596,147 @@ Manual trigger is also supported via `workflow_dispatch` — useful during incid
 
 ```bash
 gh workflow run drift-detection.yml -f environments='["prod"]'
+```
+
+## Orphan Resource Detection
+
+A reusable workflow at `.github/workflows/orphan-detection.yml` that finds Azure resources not managed by any Terraform state — leftovers from deleted stacks, manual creation, or failed cleanups.
+
+### How it works
+
+1. Runs `terraform state list` to get all managed resource IDs
+2. Queries Azure Resource Graph for all resources in the resource group
+3. Compares the two lists — resources in Azure but not in state are orphans
+4. Filters out auto-created resources (Network Watcher, Security Center, Advisor)
+5. Groups orphans by resource type and creates a GitHub issue
+
+### What it excludes
+
+Auto-created resources that Azure manages are filtered out:
+- `microsoft.network/networkwatchers` (auto-created per region)
+- `microsoft.security/*` (Security Center)
+- `microsoft.advisor/*` (Advisor recommendations)
+- `microsoft.alertsmanagement/*`
+
+### Setup
+
+Copy `.github/workflows/orphan-detection-caller-template.yml` to your caller repo. Recommended: weekly on Mondays.
+
+## Environment Divergence Check
+
+A reusable workflow at `.github/workflows/environment-divergence.yml` that compares resource types and counts across environments to detect when they've drifted apart.
+
+### How it works
+
+1. Runs `terraform state list` for each environment
+2. Parses resource types and counts (e.g., `azurerm_virtual_network: 2`)
+3. Compares each environment against a reference (default: `prod`)
+4. Generates a comparison matrix flagging:
+   - **MISSING** — resource type in reference but not in compare environment
+   - **EXTRA** — resource type in compare environment but not in reference
+   - **MISMATCH** — different resource counts
+
+### Example output
+
+```
+| Resource Type | prod | stage | dev |
+| --- | --- | --- | --- |
+| azurerm_virtual_network | 2 | 2 | 1 (MISMATCH) |
+| azurerm_kubernetes_cluster | 1 | 1 | - (MISSING) |
+| azurerm_storage_account | 3 | 2 (MISMATCH) | 2 (MISMATCH) |
+```
+
+### Configuration
+
+| Input | Default | Description |
+| --- | --- | --- |
+| `reference_environment` | `prod` | Environment to compare others against |
+| `compare_environments` | `""` (all) | JSON array of environments to compare |
+| `create_issues` | `true` | Create issues when divergence is detected |
+
+### When divergence is expected
+
+Count differences between dev and prod are normal (prod has more replicas). The key value is detecting:
+- Resources in prod that are completely missing from stage (deployment wasn't promoted)
+- Resources in stage/dev that don't exist in prod (stale experiments)
+
+### Setup
+
+Copy `.github/workflows/environment-divergence-caller-template.yml` to your caller repo. Recommended: weekly on Mondays.
+
+## Secret and Credential Expiry Monitoring
+
+A reusable workflow at `.github/workflows/secret-expiry.yml` that monitors for expiring credentials across the Azure tenant.
+
+### What it checks
+
+| Credential type | Source | How it queries |
+| --- | --- | --- |
+| Key Vault secrets | All vaults in subscription (or specified list) | `az keyvault secret list` |
+| Key Vault certificates | All vaults in subscription | `az keyvault certificate list` |
+| Key Vault keys | All vaults in subscription | `az keyvault key list` |
+| App registration client secrets | Azure AD | `az ad app list` — `passwordCredentials` |
+| App registration certificates | Azure AD | `az ad app list` — `keyCredentials` |
+| Service principal credentials | Azure AD | `az ad sp list` — `passwordCredentials` |
+
+### Severity levels
+
+| Severity | Condition | GitHub annotation |
+| --- | --- | --- |
+| EXPIRED | Past expiry date | `::error` |
+| CRITICAL | Expires within `critical_days` (default: 7) | `::warning` |
+| WARNING | Expires within `warning_days` (default: 30) | `::notice` |
+
+### Issue behavior
+
+- Creates a single issue titled "Secret expiry alert: N credential(s) need attention [SEVERITY]"
+- Updates the same issue on subsequent runs (doesn't create duplicates)
+- Includes remediation steps for each credential type
+- Issue severity reflects the most urgent finding
+
+### Configuration
+
+| Input | Default | Description |
+| --- | --- | --- |
+| `warning_days` | `30` | Days before expiry to trigger a warning |
+| `critical_days` | `7` | Days before expiry to trigger a critical alert |
+| `key_vault_names` | `""` (all) | JSON array of specific vaults to check |
+| `check_app_registrations` | `true` | Check Azure AD app registration secrets |
+| `check_service_principals` | `true` | Check service principal credentials |
+
+### Prerequisites
+
+The service principal running this workflow needs:
+- **Key Vault Reader** (or Key Vault Secrets User) on Key Vaults
+- **Application.Read.All** in Microsoft Graph (for app registrations)
+- **Directory.Read.All** in Microsoft Graph (for service principals)
+
+### Setup
+
+Copy `.github/workflows/secret-expiry-caller-template.yml` to your caller repo. Recommended: daily.
+
+## All Reusable Workflows
+
+| Workflow | Trigger | Purpose |
+| --- | --- | --- |
+| `terraform-pipeline.yml` | PR + merge to main | CI/CD: validate, plan, OPA, cost, deploy |
+| `drift-detection.yml` | Daily schedule | Detect out-of-band infrastructure changes with activity log attribution |
+| `orphan-detection.yml` | Weekly schedule | Find resources not managed by Terraform |
+| `environment-divergence.yml` | Weekly schedule | Compare resource types across environments |
+| `secret-expiry.yml` | Daily schedule | Monitor Key Vault, app registration, and SP credential expiry |
+| `blocklist-refresh.yml` | Every 6 hours | Update IP/FQDN blocklists |
+| `module-ci.yml` | PR + push (module repos) | Unit tests, integration tests, OPA tests |
+
+### Caller repo workflows
+
+```
+.github/workflows/
+├── terraform.yml              # CI/CD pipeline (PR + merge)
+├── drift-detection.yml        # daily
+├── secret-expiry.yml          # daily
+├── orphan-detection.yml       # weekly
+├── environment-divergence.yml # weekly
+└── blocklist-refresh.yml      # every 6 hours
 ```
 
 ## Blocklist Refresh Pipeline

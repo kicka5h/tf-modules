@@ -1,0 +1,45 @@
+# TEMPLATE: Copy this file to your caller repo at .github/workflows/environment-divergence.yml
+#
+# Compares Terraform state across environments to detect divergence.
+# When environments have drifted apart (e.g., stage has resources prod doesn't),
+# creates a GitHub issue with a comparison matrix and remediation steps.
+#
+# Prerequisites:
+#   - ARM_* secrets at repo or environment level
+#   - Labels "divergence", "infrastructure", "automated" created in the repo
+#   - (Optional) Set issue_assignees to the on-call or platform team
+
+name: Environment Divergence Check
+
+on:
+  schedule:
+    # Run weekly on Monday at 7 AM UTC
+    - cron: "0 7 * * 1"
+  workflow_dispatch:
+    inputs:
+      reference_environment:
+        description: "Reference environment to compare against"
+        required: false
+        default: "prod"
+      compare_environments:
+        description: "JSON array of environments to compare (leave empty for all)"
+        required: false
+        default: ""
+
+jobs:
+  divergence:
+    uses: <org>/<repo>/.github/workflows/environment-divergence.yml@main
+    with:
+      shared_directory: "shared"
+      environments_directory: "environments"
+      terraform_version: "1.9.0"
+      reference_environment: ${{ github.event.inputs.reference_environment || 'prod' }}
+      compare_environments: ${{ github.event.inputs.compare_environments || '' }}
+      create_issues: true
+      issue_assignees: ""  # e.g., "platform-lead,sre-oncall"
+      issue_labels: "divergence,infrastructure,automated"
+    secrets:
+      ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+      ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}

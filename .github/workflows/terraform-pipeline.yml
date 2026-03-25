@@ -170,6 +170,71 @@ jobs:
         working-directory: ${{ inputs.shared_directory }}
         run: terraform init
 
+      - name: Version pinning check
+        working-directory: ${{ inputs.shared_directory }}
+        run: |
+          echo "## Version Pinning Check" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          WARNINGS=0
+          ERRORS=0
+
+          # Check 1: Lock file exists
+          if [ ! -f ".terraform.lock.hcl" ]; then
+            echo "::error::No .terraform.lock.hcl found. Provider versions are not pinned. Commit this file to the repo."
+            echo "| Lock file | MISSING — provider versions not pinned |" >> "$GITHUB_STEP_SUMMARY"
+            ERRORS=$((ERRORS + 1))
+          else
+            echo "| Lock file | Present |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          # Check 2: Terraform version matches constraint
+          TF_VERSION=$(terraform version -json | jq -r '.terraform_version')
+          echo "| Terraform version | $TF_VERSION |" >> "$GITHUB_STEP_SUMMARY"
+
+          # Check required_version constraints in .tf files
+          REQUIRED=$(grep -rh 'required_version' *.tf 2>/dev/null | head -1 | sed 's/.*"\(.*\)".*/\1/' || echo "")
+          if [ -n "$REQUIRED" ]; then
+            echo "| Required version constraint | \`$REQUIRED\` |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          # Check 3: Provider version constraints
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Provider Versions" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Provider | Installed | Constraint | Status |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| --- | --- | --- | --- |" >> "$GITHUB_STEP_SUMMARY"
+
+          # Parse installed provider versions
+          terraform version -json | jq -r '.provider_selections | to_entries[] | "\(.key) \(.value)"' | while read -r PROVIDER VERSION; do
+            # Check if the provider has a version constraint in required_providers
+            SHORT_NAME=$(echo "$PROVIDER" | rev | cut -d'/' -f1 | rev)
+            CONSTRAINT=$(grep -A5 "\"$SHORT_NAME\"" *.tf 2>/dev/null | grep 'version' | head -1 | sed 's/.*"\(.*\)".*/\1/' || echo "none")
+
+            if [ "$CONSTRAINT" = "none" ]; then
+              echo "| $PROVIDER | $VERSION | none | WARNING — no constraint |" >> "$GITHUB_STEP_SUMMARY"
+              echo "::warning::Provider $PROVIDER has no version constraint. Pin it in required_providers."
+              WARNINGS=$((WARNINGS + 1))
+            elif echo "$CONSTRAINT" | grep -q '^>=.*' && ! echo "$CONSTRAINT" | grep -q ','; then
+              echo "| $PROVIDER | $VERSION | \`$CONSTRAINT\` | WARNING — no upper bound |" >> "$GITHUB_STEP_SUMMARY"
+              echo "::warning::Provider $PROVIDER uses loose constraint '$CONSTRAINT'. Add an upper bound (e.g., '>= x.y, < z.0')."
+              WARNINGS=$((WARNINGS + 1))
+            else
+              echo "| $PROVIDER | $VERSION | \`$CONSTRAINT\` | OK |" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+
+          if [ $ERRORS -gt 0 ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "**$ERRORS error(s), $WARNINGS warning(s)**" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          elif [ $WARNINGS -gt 0 ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "**$WARNINGS warning(s)** — consider tightening version constraints" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "All version checks passed." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: Terraform Validate
         working-directory: ${{ inputs.shared_directory }}
         run: terraform validate
@@ -359,6 +424,51 @@ jobs:
           [ -f "$ENV_DIR/backend.tf" ] && cp "$ENV_DIR/backend.tf" "$WORK_DIR/backend.tf"
           cd "$WORK_DIR" && terraform init
 
+      - name: Version pinning check (warning only)
+        working-directory: ${{ inputs.shared_directory }}
+        run: |
+          echo "## Version Pinning Check (dev)" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          # Check 1: Lock file exists
+          if [ ! -f ".terraform.lock.hcl" ]; then
+            echo "::warning::No .terraform.lock.hcl found. Provider versions are not pinned."
+            echo "| Lock file | MISSING — provider versions not pinned |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| Lock file | Present |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          # Check 2: Terraform version
+          TF_VERSION=$(terraform version -json | jq -r '.terraform_version')
+          echo "| Terraform version | $TF_VERSION |" >> "$GITHUB_STEP_SUMMARY"
+
+          REQUIRED=$(grep -rh 'required_version' *.tf 2>/dev/null | head -1 | sed 's/.*"\(.*\)".*/\1/' || echo "")
+          if [ -n "$REQUIRED" ]; then
+            echo "| Required version constraint | \`$REQUIRED\` |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          # Check 3: Provider version constraints
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Provider Versions" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Provider | Installed | Constraint | Status |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| --- | --- | --- | --- |" >> "$GITHUB_STEP_SUMMARY"
+
+          terraform version -json | jq -r '.provider_selections | to_entries[] | "\(.key) \(.value)"' | while read -r PROVIDER VERSION; do
+            SHORT_NAME=$(echo "$PROVIDER" | rev | cut -d'/' -f1 | rev)
+            CONSTRAINT=$(grep -A5 "\"$SHORT_NAME\"" *.tf 2>/dev/null | grep 'version' | head -1 | sed 's/.*"\(.*\)".*/\1/' || echo "none")
+
+            if [ "$CONSTRAINT" = "none" ]; then
+              echo "| $PROVIDER | $VERSION | none | WARNING — no constraint |" >> "$GITHUB_STEP_SUMMARY"
+              echo "::warning::Provider $PROVIDER has no version constraint. Pin it in required_providers."
+            elif echo "$CONSTRAINT" | grep -q '^>=.*' && ! echo "$CONSTRAINT" | grep -q ','; then
+              echo "| $PROVIDER | $VERSION | \`$CONSTRAINT\` | WARNING — no upper bound |" >> "$GITHUB_STEP_SUMMARY"
+              echo "::warning::Provider $PROVIDER uses loose constraint '$CONSTRAINT'. Add an upper bound."
+            else
+              echo "| $PROVIDER | $VERSION | \`$CONSTRAINT\` | OK |" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+
       - name: Terraform Apply
         working-directory: ${{ inputs.shared_directory }}
         run: |
@@ -396,6 +506,51 @@ jobs:
           WORK_DIR="${{ inputs.shared_directory }}"
           [ -f "$ENV_DIR/backend.tf" ] && cp "$ENV_DIR/backend.tf" "$WORK_DIR/backend.tf"
           cd "$WORK_DIR" && terraform init
+
+      - name: Version pinning check (warning only)
+        working-directory: ${{ inputs.shared_directory }}
+        run: |
+          echo "## Version Pinning Check (qa)" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          # Check 1: Lock file exists
+          if [ ! -f ".terraform.lock.hcl" ]; then
+            echo "::warning::No .terraform.lock.hcl found. Provider versions are not pinned."
+            echo "| Lock file | MISSING — provider versions not pinned |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| Lock file | Present |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          # Check 2: Terraform version
+          TF_VERSION=$(terraform version -json | jq -r '.terraform_version')
+          echo "| Terraform version | $TF_VERSION |" >> "$GITHUB_STEP_SUMMARY"
+
+          REQUIRED=$(grep -rh 'required_version' *.tf 2>/dev/null | head -1 | sed 's/.*"\(.*\)".*/\1/' || echo "")
+          if [ -n "$REQUIRED" ]; then
+            echo "| Required version constraint | \`$REQUIRED\` |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          # Check 3: Provider version constraints
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Provider Versions" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Provider | Installed | Constraint | Status |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| --- | --- | --- | --- |" >> "$GITHUB_STEP_SUMMARY"
+
+          terraform version -json | jq -r '.provider_selections | to_entries[] | "\(.key) \(.value)"' | while read -r PROVIDER VERSION; do
+            SHORT_NAME=$(echo "$PROVIDER" | rev | cut -d'/' -f1 | rev)
+            CONSTRAINT=$(grep -A5 "\"$SHORT_NAME\"" *.tf 2>/dev/null | grep 'version' | head -1 | sed 's/.*"\(.*\)".*/\1/' || echo "none")
+
+            if [ "$CONSTRAINT" = "none" ]; then
+              echo "| $PROVIDER | $VERSION | none | WARNING — no constraint |" >> "$GITHUB_STEP_SUMMARY"
+              echo "::warning::Provider $PROVIDER has no version constraint. Pin it in required_providers."
+            elif echo "$CONSTRAINT" | grep -q '^>=.*' && ! echo "$CONSTRAINT" | grep -q ','; then
+              echo "| $PROVIDER | $VERSION | \`$CONSTRAINT\` | WARNING — no upper bound |" >> "$GITHUB_STEP_SUMMARY"
+              echo "::warning::Provider $PROVIDER uses loose constraint '$CONSTRAINT'. Add an upper bound."
+            else
+              echo "| $PROVIDER | $VERSION | \`$CONSTRAINT\` | OK |" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
 
       - name: Terraform Apply
         working-directory: ${{ inputs.shared_directory }}
@@ -437,6 +592,51 @@ jobs:
           WORK_DIR="${{ inputs.shared_directory }}"
           [ -f "$ENV_DIR/backend.tf" ] && cp "$ENV_DIR/backend.tf" "$WORK_DIR/backend.tf"
           cd "$WORK_DIR" && terraform init
+
+      - name: Version pinning check (warning only)
+        working-directory: ${{ inputs.shared_directory }}
+        run: |
+          echo "## Version Pinning Check (stage)" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          # Check 1: Lock file exists
+          if [ ! -f ".terraform.lock.hcl" ]; then
+            echo "::warning::No .terraform.lock.hcl found. Provider versions are not pinned."
+            echo "| Lock file | MISSING — provider versions not pinned |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| Lock file | Present |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          # Check 2: Terraform version
+          TF_VERSION=$(terraform version -json | jq -r '.terraform_version')
+          echo "| Terraform version | $TF_VERSION |" >> "$GITHUB_STEP_SUMMARY"
+
+          REQUIRED=$(grep -rh 'required_version' *.tf 2>/dev/null | head -1 | sed 's/.*"\(.*\)".*/\1/' || echo "")
+          if [ -n "$REQUIRED" ]; then
+            echo "| Required version constraint | \`$REQUIRED\` |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          # Check 3: Provider version constraints
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Provider Versions" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Provider | Installed | Constraint | Status |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| --- | --- | --- | --- |" >> "$GITHUB_STEP_SUMMARY"
+
+          terraform version -json | jq -r '.provider_selections | to_entries[] | "\(.key) \(.value)"' | while read -r PROVIDER VERSION; do
+            SHORT_NAME=$(echo "$PROVIDER" | rev | cut -d'/' -f1 | rev)
+            CONSTRAINT=$(grep -A5 "\"$SHORT_NAME\"" *.tf 2>/dev/null | grep 'version' | head -1 | sed 's/.*"\(.*\)".*/\1/' || echo "none")
+
+            if [ "$CONSTRAINT" = "none" ]; then
+              echo "| $PROVIDER | $VERSION | none | WARNING — no constraint |" >> "$GITHUB_STEP_SUMMARY"
+              echo "::warning::Provider $PROVIDER has no version constraint. Pin it in required_providers."
+            elif echo "$CONSTRAINT" | grep -q '^>=.*' && ! echo "$CONSTRAINT" | grep -q ','; then
+              echo "| $PROVIDER | $VERSION | \`$CONSTRAINT\` | WARNING — no upper bound |" >> "$GITHUB_STEP_SUMMARY"
+              echo "::warning::Provider $PROVIDER uses loose constraint '$CONSTRAINT'. Add an upper bound."
+            else
+              echo "| $PROVIDER | $VERSION | \`$CONSTRAINT\` | OK |" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
 
       - name: Terraform Plan
         working-directory: ${{ inputs.shared_directory }}
@@ -482,6 +682,51 @@ jobs:
           WORK_DIR="${{ inputs.shared_directory }}"
           [ -f "$ENV_DIR/backend.tf" ] && cp "$ENV_DIR/backend.tf" "$WORK_DIR/backend.tf"
           cd "$WORK_DIR" && terraform init
+
+      - name: Version pinning check (warning only)
+        working-directory: ${{ inputs.shared_directory }}
+        run: |
+          echo "## Version Pinning Check (prod)" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          # Check 1: Lock file exists
+          if [ ! -f ".terraform.lock.hcl" ]; then
+            echo "::warning::No .terraform.lock.hcl found. Provider versions are not pinned."
+            echo "| Lock file | MISSING — provider versions not pinned |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| Lock file | Present |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          # Check 2: Terraform version
+          TF_VERSION=$(terraform version -json | jq -r '.terraform_version')
+          echo "| Terraform version | $TF_VERSION |" >> "$GITHUB_STEP_SUMMARY"
+
+          REQUIRED=$(grep -rh 'required_version' *.tf 2>/dev/null | head -1 | sed 's/.*"\(.*\)".*/\1/' || echo "")
+          if [ -n "$REQUIRED" ]; then
+            echo "| Required version constraint | \`$REQUIRED\` |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          # Check 3: Provider version constraints
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Provider Versions" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Provider | Installed | Constraint | Status |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| --- | --- | --- | --- |" >> "$GITHUB_STEP_SUMMARY"
+
+          terraform version -json | jq -r '.provider_selections | to_entries[] | "\(.key) \(.value)"' | while read -r PROVIDER VERSION; do
+            SHORT_NAME=$(echo "$PROVIDER" | rev | cut -d'/' -f1 | rev)
+            CONSTRAINT=$(grep -A5 "\"$SHORT_NAME\"" *.tf 2>/dev/null | grep 'version' | head -1 | sed 's/.*"\(.*\)".*/\1/' || echo "none")
+
+            if [ "$CONSTRAINT" = "none" ]; then
+              echo "| $PROVIDER | $VERSION | none | WARNING — no constraint |" >> "$GITHUB_STEP_SUMMARY"
+              echo "::warning::Provider $PROVIDER has no version constraint. Pin it in required_providers."
+            elif echo "$CONSTRAINT" | grep -q '^>=.*' && ! echo "$CONSTRAINT" | grep -q ','; then
+              echo "| $PROVIDER | $VERSION | \`$CONSTRAINT\` | WARNING — no upper bound |" >> "$GITHUB_STEP_SUMMARY"
+              echo "::warning::Provider $PROVIDER uses loose constraint '$CONSTRAINT'. Add an upper bound."
+            else
+              echo "| $PROVIDER | $VERSION | \`$CONSTRAINT\` | OK |" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
 
       - name: Terraform Plan
         working-directory: ${{ inputs.shared_directory }}

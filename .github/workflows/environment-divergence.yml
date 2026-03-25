@@ -1,0 +1,454 @@
+# Reusable environment divergence detection workflow.
+#
+# Compares Terraform state across environments to detect when they have diverged.
+# For example: stage has resources that prod doesn't, or prod has a different
+# resource configuration than what stage validated.
+#
+# For each environment:
+#   1. Runs terraform state list to get managed resources
+#   2. Parses resource types and counts them
+#   3. Compares all environments against a reference (typically prod)
+#   4. Posts a comparison matrix and optionally creates a GitHub issue
+#
+# Divergence is informational — it does NOT auto-remediate. The team reviews
+# and decides whether to promote, remove, or document intentional differences.
+
+name: Environment Divergence Check
+
+on:
+  workflow_call:
+    inputs:
+      shared_directory:
+        description: "Directory containing the shared Terraform code"
+        required: false
+        type: string
+        default: "shared"
+      environments_directory:
+        description: "Base directory containing environment subdirectories"
+        required: false
+        type: string
+        default: "environments"
+      terraform_version:
+        description: "Terraform version to use"
+        required: false
+        type: string
+        default: "latest"
+      reference_environment:
+        description: "The environment to compare others against (typically 'prod')"
+        required: false
+        type: string
+        default: "prod"
+      compare_environments:
+        description: "JSON array of environments to compare against the reference. Empty compares all."
+        required: false
+        type: string
+        default: ""
+      create_issues:
+        description: "Create a GitHub issue when divergence is detected"
+        required: false
+        type: boolean
+        default: true
+      issue_assignees:
+        description: "Comma-separated list of GitHub usernames to assign divergence issues to"
+        required: false
+        type: string
+        default: ""
+      issue_labels:
+        description: "Comma-separated list of labels for divergence issues"
+        required: false
+        type: string
+        default: "divergence,infrastructure,automated"
+    secrets:
+      ARM_CLIENT_ID:
+        required: true
+      ARM_CLIENT_SECRET:
+        required: true
+      ARM_SUBSCRIPTION_ID:
+        required: true
+      ARM_TENANT_ID:
+        required: true
+
+jobs:
+  detect-environments:
+    name: Detect environments
+    runs-on: ubuntu-latest
+    outputs:
+      all_environments: ${{ steps.detect.outputs.all_environments }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect environments
+        id: detect
+        run: |
+          ENV_DIR="${{ inputs.environments_directory }}"
+          REFERENCE="${{ inputs.reference_environment }}"
+          COMPARE='${{ inputs.compare_environments }}'
+
+          if [ -n "$COMPARE" ] && [ "$COMPARE" != "" ]; then
+            # Merge reference + compare into a single deduplicated list
+            ALL=$(echo "$COMPARE" | python3 -c "
+          import json, sys
+          compare = json.load(sys.stdin)
+          ref = '$REFERENCE'
+          all_envs = [ref] + [e for e in compare if e != ref]
+          print(json.dumps(all_envs))
+          ")
+            echo "all_environments=$ALL" >> "$GITHUB_OUTPUT"
+          else
+            # Auto-detect all environments from directory structure
+            ENVS=()
+            for DIR in "$ENV_DIR"/*/; do
+              ENV_NAME=$(basename "$DIR")
+              ENVS+=("$ENV_NAME")
+            done
+            JSON=$(printf '%s\n' "${ENVS[@]}" | jq -R . | jq -sc .)
+            echo "all_environments=$JSON" >> "$GITHUB_OUTPUT"
+          fi
+
+  collect-state:
+    name: "Collect state (${{ matrix.environment }})"
+    needs: detect-environments
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: ${{ fromJson(needs.detect-environments.outputs.all_environments) }}
+    env:
+      ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+      ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+          terraform_wrapper: false
+
+      - name: Prepare working directory
+        run: |
+          WORK_DIR="${{ inputs.shared_directory }}"
+          ENV_DIR="${{ inputs.environments_directory }}/${{ matrix.environment }}"
+          if [ -f "$ENV_DIR/backend.tf" ]; then
+            cp "$ENV_DIR/backend.tf" "$WORK_DIR/backend.tf"
+          fi
+
+      - name: Terraform Init
+        working-directory: ${{ inputs.shared_directory }}
+        run: terraform init
+
+      - name: Collect resource state
+        id: state
+        working-directory: ${{ inputs.shared_directory }}
+        run: |
+          set +e
+          STATE_OUTPUT=$(terraform state list 2>&1)
+          EXIT_CODE=$?
+          set -e
+
+          if [ $EXIT_CODE -ne 0 ]; then
+            echo "::warning::terraform state list failed for ${{ matrix.environment }}: $STATE_OUTPUT"
+            echo '{"_error": "state list failed"}' > /tmp/state-resources.json
+          elif [ -z "$STATE_OUTPUT" ]; then
+            echo "::warning::No resources found in state for ${{ matrix.environment }}"
+            echo '{}' > /tmp/state-resources.json
+          else
+            # Parse resource types and count them
+            # terraform state list outputs lines like:
+            #   azurerm_virtual_network.main
+            #   azurerm_subnet.internal
+            #   module.aks.azurerm_kubernetes_cluster.main
+            # We extract the resource type (last type.name pair) and count occurrences
+            echo "$STATE_OUTPUT" | python3 -c "
+          import json, sys, re
+          from collections import Counter
+
+          counts = Counter()
+          for line in sys.stdin:
+              line = line.strip()
+              if not line or line.startswith('#'):
+                  continue
+              # Handle module paths: module.x.module.y.resource_type.name
+              # Also handle data sources: data.azurerm_xxx.name
+              # Extract the resource type (without the instance name)
+              # Split on '.' and find the resource type
+              parts = line.split('.')
+              # Filter out 'module' and module names to get to resource_type.name
+              # Pattern: (module.NAME.)* (data.)? RESOURCE_TYPE.NAME ([N])?
+              resource_type = None
+              i = 0
+              while i < len(parts):
+                  if parts[i] == 'module':
+                      i += 2  # skip 'module' and module name
+                  elif parts[i] == 'data':
+                      if i + 1 < len(parts):
+                          resource_type = 'data.' + parts[i + 1]
+                      break
+                  else:
+                      resource_type = parts[i]
+                      break
+              if resource_type:
+                  # Remove any index suffix like [0]
+                  resource_type = re.sub(r'\[.*\]$', '', resource_type)
+                  counts[resource_type] += 1
+
+          print(json.dumps(dict(sorted(counts.items())), indent=2))
+          " > /tmp/state-resources.json
+          fi
+
+          echo "Environment: ${{ matrix.environment }}"
+          echo "Resource types found:"
+          cat /tmp/state-resources.json
+
+      - name: Upload state artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: state-${{ matrix.environment }}
+          path: /tmp/state-resources.json
+          retention-days: 1
+
+  compare:
+    name: Compare environments
+    needs: [detect-environments, collect-state]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all state artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/artifacts
+          pattern: state-*
+
+      - name: Compare environments and generate report
+        id: compare
+        run: |
+          REFERENCE="${{ inputs.reference_environment }}"
+          ALL_ENVS='${{ needs.detect-environments.outputs.all_environments }}'
+
+          python3 << 'PYEOF'
+          import json, os, sys
+
+          reference = os.environ.get("REFERENCE", "prod")
+          all_envs = json.loads(os.environ.get("ALL_ENVS", "[]"))
+          artifacts_dir = "/tmp/artifacts"
+
+          # Load all environment state files
+          env_data = {}
+          for env in all_envs:
+              state_file = os.path.join(artifacts_dir, f"state-{env}", "state-resources.json")
+              try:
+                  with open(state_file) as f:
+                      data = json.load(f)
+                  if "_error" in data:
+                      env_data[env] = None  # Mark as failed
+                  else:
+                      env_data[env] = data
+              except (FileNotFoundError, json.JSONDecodeError) as e:
+                  print(f"::warning::Could not load state for {env}: {e}")
+                  env_data[env] = None
+
+          # Determine compare environments (all except reference)
+          compare_envs = [e for e in all_envs if e != reference]
+
+          # Collect all resource types across all environments
+          all_resource_types = set()
+          for env, data in env_data.items():
+              if data is not None:
+                  all_resource_types.update(data.keys())
+          all_resource_types = sorted(all_resource_types)
+
+          # Check if reference environment loaded successfully
+          ref_data = env_data.get(reference)
+          if ref_data is None:
+              report = f"## Environment Divergence Report\n\n"
+              report += f"**ERROR:** Could not load state for reference environment `{reference}`.\n"
+              report += "Check the collect-state job logs for details.\n"
+
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+                  f.write(report)
+
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write("divergence_found=false\n")
+                  f.write("has_error=true\n")
+              sys.exit(0)
+
+          # Build comparison matrix and track divergences
+          divergences = {}  # env -> list of divergence descriptions
+          for env in compare_envs:
+              divergences[env] = []
+
+          # Build the header
+          env_columns = [reference] + compare_envs
+          header = "| Resource Type | " + " | ".join(f"`{e}`" for e in env_columns) + " |"
+          separator = "| --- | " + " | ".join("---" for _ in env_columns) + " |"
+
+          rows = []
+          for rt in all_resource_types:
+              ref_count = ref_data.get(rt, 0)
+              cells = [str(ref_count) if ref_count > 0 else "-"]
+
+              for env in compare_envs:
+                  data = env_data.get(env)
+                  if data is None:
+                      cells.append("ERROR")
+                      continue
+
+                  env_count = data.get(rt, 0)
+
+                  if ref_count > 0 and env_count == 0:
+                      cells.append("- (MISSING)")
+                      divergences[env].append(f"MISSING `{rt}` (exists in {reference} with count {ref_count})")
+                  elif ref_count == 0 and env_count > 0:
+                      cells.append(f"{env_count} (EXTRA)")
+                      divergences[env].append(f"EXTRA `{rt}` (count {env_count}, not in {reference})")
+                  elif ref_count != env_count:
+                      cells.append(f"{env_count} (MISMATCH)")
+                      divergences[env].append(f"COUNT MISMATCH `{rt}` ({reference}={ref_count}, {env}={env_count})")
+                  else:
+                      cells.append(str(env_count))
+
+              row = f"| `{rt}` | " + " | ".join(cells) + " |"
+              rows.append(row)
+
+          # Check if any divergence was found
+          total_divergences = sum(len(v) for v in divergences.values())
+          divergence_found = total_divergences > 0
+
+          # Build the report
+          report = "## Environment Divergence Report\n\n"
+          report += f"**Reference environment:** `{reference}`\n\n"
+
+          if not all_resource_types:
+              report += "No resources found in any environment.\n"
+          elif not divergence_found:
+              report += "All environments are in sync. No divergences detected.\n\n"
+              report += header + "\n" + separator + "\n"
+              for row in rows:
+                  report += row + "\n"
+          else:
+              report += header + "\n" + separator + "\n"
+              for row in rows:
+                  report += row + "\n"
+
+              report += "\n### Divergence Summary\n\n"
+              for env in compare_envs:
+                  if divergences[env]:
+                      report += f"**`{env}`** ({len(divergences[env])} divergence(s)):\n"
+                      for d in divergences[env]:
+                          report += f"- {d}\n"
+                      report += "\n"
+                  else:
+                      report += f"**`{env}`**: In sync with `{reference}`\n\n"
+
+          # Write step summary
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write(report)
+
+          # Write outputs
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"divergence_found={'true' if divergence_found else 'false'}\n")
+              f.write(f"total_divergences={total_divergences}\n")
+              f.write("has_error=false\n")
+
+          # Save report for issue creation
+          with open("/tmp/divergence-report.md", "w") as f:
+              f.write(report)
+
+          # Save divergence summary for issue body
+          summary_lines = []
+          for env in compare_envs:
+              if divergences[env]:
+                  summary_lines.append(f"{env}: {len(divergences[env])} divergence(s)")
+          with open("/tmp/divergence-summary.txt", "w") as f:
+              f.write("; ".join(summary_lines) if summary_lines else "No divergences")
+
+          if divergence_found:
+              print(f"::warning::Environment divergence detected: {total_divergences} total divergence(s)")
+          else:
+              print("All environments are in sync.")
+
+          PYEOF
+        env:
+          REFERENCE: ${{ inputs.reference_environment }}
+          ALL_ENVS: ${{ needs.detect-environments.outputs.all_environments }}
+
+      - name: Create GitHub issue for divergence
+        if: steps.compare.outputs.divergence_found == 'true' && inputs.create_issues
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const reference = '${{ inputs.reference_environment }}';
+            const repo = context.repo;
+            const title = `Environment divergence detected against ${reference}`;
+            const assignees = '${{ inputs.issue_assignees }}'.split(',').map(s => s.trim()).filter(s => s);
+            const labels = '${{ inputs.issue_labels }}'.split(',').map(s => s.trim()).filter(s => s);
+
+            // Load the divergence report
+            let report = '';
+            try {
+              report = fs.readFileSync('/tmp/divergence-report.md', 'utf8');
+            } catch (e) {
+              report = 'Could not load divergence report.';
+            }
+
+            let summary = '';
+            try {
+              summary = fs.readFileSync('/tmp/divergence-summary.txt', 'utf8');
+            } catch (e) {
+              summary = 'Unknown';
+            }
+
+            // Check if an open issue already exists
+            const existing = await github.rest.issues.listForRepo({
+              ...repo,
+              state: 'open',
+              labels: labels.join(','),
+            });
+
+            const existingIssue = existing.data.find(i => i.title === title);
+
+            const body = [
+              report,
+              '',
+              '### Remediation',
+              '',
+              '1. **Review** the comparison matrix above to identify divergences',
+              '2. **Determine intent** — is the difference intentional (e.g., dev has fewer replicas) or accidental (e.g., a deployment was not promoted)?',
+              '3. **Remediate** by either:',
+              '   - Promoting missing resources to the target environment',
+              '   - Removing extra resources that should not exist',
+              '   - Documenting intentional differences in your environment configuration',
+              '4. **Close** this issue once divergences are resolved or documented',
+              '',
+              `**Workflow run:** ${context.serverUrl}/${repo.owner}/${repo.repo}/actions/runs/${context.runId}`,
+              `**Detected at:** ${new Date().toISOString()}`,
+            ].join('\n');
+
+            if (existingIssue) {
+              await github.rest.issues.createComment({
+                ...repo,
+                issue_number: existingIssue.number,
+                body: [
+                  `Divergence still present as of ${new Date().toISOString()}.`,
+                  '',
+                  `**Summary:** ${summary}`,
+                  `**Run:** ${context.serverUrl}/${repo.owner}/${repo.repo}/actions/runs/${context.runId}`,
+                  '',
+                  report,
+                ].join('\n'),
+              });
+              core.info(`Updated existing issue #${existingIssue.number}`);
+            } else {
+              const issue = await github.rest.issues.create({
+                ...repo,
+                title,
+                body,
+                assignees,
+                labels,
+              });
+              core.info(`Created issue #${issue.data.number}`);
+            }

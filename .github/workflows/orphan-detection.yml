@@ -1,0 +1,452 @@
+# Reusable orphan resource detection workflow.
+#
+# Detects Azure resources that exist in the subscription but are NOT managed
+# by any Terraform state file. These are "orphans" — leftovers from deleted
+# stacks, manual creation, or failed cleanups.
+#
+# For each environment:
+#   1. Runs terraform state list to get all managed resource IDs
+#   2. Queries Azure Resource Graph for all resources in the resource group(s)
+#   3. Compares the two lists — resources in Azure but NOT in state are orphans
+#   4. Reports findings as a GitHub issue and step summary
+#
+# Orphan detection is informational — it does NOT auto-delete. The team reviews
+# and decides whether to import into Terraform, delete, or add to an ignore list.
+
+name: Orphan Resource Detection
+
+on:
+  workflow_call:
+    inputs:
+      shared_directory:
+        description: "Directory containing the shared Terraform code"
+        required: false
+        type: string
+        default: "shared"
+      environments_directory:
+        description: "Base directory containing environment subdirectories"
+        required: false
+        type: string
+        default: "environments"
+      terraform_version:
+        description: "Terraform version to use"
+        required: false
+        type: string
+        default: "latest"
+      environments:
+        description: "JSON array of environments to check (e.g., '[\"dev\",\"qa\",\"stage\",\"prod\"]'). If empty, checks all."
+        required: false
+        type: string
+        default: ""
+      create_issues:
+        description: "Create a GitHub issue when orphans are detected"
+        required: false
+        type: boolean
+        default: true
+      issue_assignees:
+        description: "Comma-separated list of GitHub usernames to assign orphan issues to"
+        required: false
+        type: string
+        default: ""
+      issue_labels:
+        description: "Comma-separated list of labels for orphan issues"
+        required: false
+        type: string
+        default: "orphan,infrastructure,automated"
+    secrets:
+      ARM_CLIENT_ID:
+        required: true
+      ARM_CLIENT_SECRET:
+        required: true
+      ARM_SUBSCRIPTION_ID:
+        required: true
+      ARM_TENANT_ID:
+        required: true
+
+jobs:
+  detect-environments:
+    name: Detect environments
+    runs-on: ubuntu-latest
+    outputs:
+      environments: ${{ steps.detect.outputs.environments }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect environments
+        id: detect
+        run: |
+          ENV_DIR="${{ inputs.environments_directory }}"
+
+          if [ -n '${{ inputs.environments }}' ] && [ '${{ inputs.environments }}' != '' ]; then
+            echo "environments=${{ inputs.environments }}" >> "$GITHUB_OUTPUT"
+          else
+            ENVS=()
+            for DIR in "$ENV_DIR"/*/; do
+              ENV_NAME=$(basename "$DIR")
+              ENVS+=("$ENV_NAME")
+            done
+            JSON=$(printf '%s\n' "${ENVS[@]}" | jq -R . | jq -sc .)
+            echo "environments=$JSON" >> "$GITHUB_OUTPUT"
+          fi
+
+  check-orphans:
+    name: "Orphan check (${{ matrix.environment }})"
+    needs: detect-environments
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: ${{ fromJson(needs.detect-environments.outputs.environments) }}
+    env:
+      ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+      ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+          terraform_wrapper: false
+
+      - name: Prepare working directory
+        run: |
+          WORK_DIR="${{ inputs.shared_directory }}"
+          ENV_DIR="${{ inputs.environments_directory }}/${{ matrix.environment }}"
+          if [ -f "$ENV_DIR/backend.tf" ]; then
+            cp "$ENV_DIR/backend.tf" "$WORK_DIR/backend.tf"
+          fi
+
+      - name: Terraform Init
+        working-directory: ${{ inputs.shared_directory }}
+        run: terraform init
+
+      - name: Get managed resource IDs from Terraform state
+        id: state
+        working-directory: ${{ inputs.shared_directory }}
+        run: |
+          set +e
+          terraform state list > /tmp/tf-state-resources.txt 2>&1
+          EXIT_CODE=$?
+          set -e
+
+          if [ $EXIT_CODE -ne 0 ]; then
+            echo "::warning::terraform state list failed for ${{ matrix.environment }}"
+            echo "state_count=0" >> "$GITHUB_OUTPUT"
+            touch /tmp/tf-state-ids.txt
+            exit 0
+          fi
+
+          STATE_COUNT=$(wc -l < /tmp/tf-state-resources.txt | tr -d ' ')
+          echo "state_count=$STATE_COUNT" >> "$GITHUB_OUTPUT"
+          echo "Found $STATE_COUNT resources in Terraform state."
+
+          # Get the full Azure resource IDs for each managed resource
+          > /tmp/tf-state-ids.txt
+          while IFS= read -r resource; do
+            # Skip data sources — they are not managed resources
+            if [[ "$resource" == data.* ]]; then
+              continue
+            fi
+            # Get the resource ID from terraform state show
+            RESOURCE_ID=$(terraform state show "$resource" 2>/dev/null | grep -E '^\s+id\s+=' | head -1 | sed 's/.*=\s*"\(.*\)"/\1/' | tr '[:upper:]' '[:lower:]')
+            if [ -n "$RESOURCE_ID" ] && [ "$RESOURCE_ID" != '""' ]; then
+              echo "$RESOURCE_ID" >> /tmp/tf-state-ids.txt
+            fi
+          done < /tmp/tf-state-resources.txt
+
+          MANAGED_COUNT=$(wc -l < /tmp/tf-state-ids.txt | tr -d ' ')
+          echo "Resolved $MANAGED_COUNT Azure resource IDs from Terraform state."
+
+      - name: Extract resource group name
+        id: rg
+        run: |
+          ENV_DIR="${{ github.workspace }}/${{ inputs.environments_directory }}/${{ matrix.environment }}"
+          RG_NAME=$(grep -h 'resource_group_name' "$ENV_DIR"/*.tfvars 2>/dev/null | head -1 | sed 's/.*=\s*"\(.*\)"/\1/' || echo "")
+
+          if [ -z "$RG_NAME" ]; then
+            # Fallback: try to extract from terraform state
+            RG_NAME=$(head -5 /tmp/tf-state-ids.txt 2>/dev/null | grep -oP '(?<=/resourceGroups/)[^/]+' | head -1 || echo "")
+          fi
+
+          if [ -z "$RG_NAME" ]; then
+            echo "::error::Could not determine resource group name for ${{ matrix.environment }}"
+            echo "rg_name=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Resource group: $RG_NAME"
+          echo "rg_name=$RG_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Login to Azure CLI
+        if: steps.rg.outputs.rg_name != ''
+        run: |
+          if ! command -v az &> /dev/null; then
+            curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+          fi
+
+          az login --service-principal \
+            -u "$ARM_CLIENT_ID" \
+            -p "$ARM_CLIENT_SECRET" \
+            --tenant "$ARM_TENANT_ID" \
+            --output none 2>/dev/null
+
+          az account set --subscription "$ARM_SUBSCRIPTION_ID" 2>/dev/null
+
+      - name: Query Azure Resource Graph for actual resources
+        id: azure
+        if: steps.rg.outputs.rg_name != ''
+        run: |
+          RG_NAME="${{ steps.rg.outputs.rg_name }}"
+
+          # Query Azure Resource Graph for all resources in the resource group
+          az graph query -q "
+            Resources
+            | where resourceGroup =~ '$RG_NAME'
+            | project id, name, type, location, resourceGroup
+          " --output json > /tmp/azure-resources.json 2>/dev/null
+
+          AZURE_COUNT=$(python3 -c "
+          import json
+          with open('/tmp/azure-resources.json') as f:
+            data = json.load(f)
+          resources = data.get('data', data) if isinstance(data, dict) else data
+          print(len(resources))
+          ")
+
+          echo "Found $AZURE_COUNT resources in Azure resource group $RG_NAME."
+          echo "azure_count=$AZURE_COUNT" >> "$GITHUB_OUTPUT"
+
+      - name: Compare and detect orphans
+        id: orphans
+        if: steps.rg.outputs.rg_name != ''
+        run: |
+          python3 << 'PYEOF'
+          import json
+          import os
+
+          # Resource types to exclude from orphan detection (auto-created or system-managed)
+          EXCLUDED_TYPES = {
+              "microsoft.network/networkwatchers",
+              "microsoft.security/assessments",
+              "microsoft.security/autoProvisioningSettings",
+              "microsoft.security/deviceSecurityGroups",
+              "microsoft.security/informationProtectionPolicies",
+              "microsoft.security/pricings",
+              "microsoft.security/securitycontacts",
+              "microsoft.security/serverVulnerabilityAssessments",
+              "microsoft.security/workspacesettings",
+              "microsoft.security/advancedthreatprotection",
+              "microsoft.advisor/recommendations",
+              "microsoft.alertsmanagement/alerts",
+              "microsoft.policyinsights/policystates",
+              "microsoft.resourcehealth/availabilitystatuses",
+          }
+
+          # Load Terraform managed IDs (already lowercased)
+          managed_ids = set()
+          try:
+              with open("/tmp/tf-state-ids.txt") as f:
+                  for line in f:
+                      line = line.strip()
+                      if line:
+                          managed_ids.add(line.lower())
+          except FileNotFoundError:
+              pass
+
+          # Load Azure resources
+          with open("/tmp/azure-resources.json") as f:
+              data = json.load(f)
+          azure_resources = data.get("data", data) if isinstance(data, dict) else data
+
+          # Compare: find orphans
+          orphans = []
+          for res in azure_resources:
+              res_id = res.get("id", "").lower()
+              res_type = res.get("type", "").lower()
+
+              # Skip excluded types
+              if any(res_type.startswith(excluded) for excluded in EXCLUDED_TYPES):
+                  continue
+
+              # Check if this resource is managed by Terraform
+              if res_id not in managed_ids:
+                  orphans.append({
+                      "id": res.get("id", ""),
+                      "name": res.get("name", ""),
+                      "type": res.get("type", ""),
+                      "location": res.get("location", ""),
+                      "resourceGroup": res.get("resourceGroup", ""),
+                  })
+
+          # Group orphans by resource type
+          grouped = {}
+          for orphan in orphans:
+              rtype = orphan["type"]
+              if rtype not in grouped:
+                  grouped[rtype] = []
+              grouped[rtype].append(orphan)
+
+          orphan_count = len(orphans)
+          print(f"Found {orphan_count} orphan resource(s).")
+
+          # Write results
+          with open("/tmp/orphan-results.json", "w") as f:
+              json.dump({"orphans": orphans, "grouped": grouped, "count": orphan_count}, f, indent=2)
+
+          # Write outputs
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"orphan_count={orphan_count}\n")
+              f.write(f"orphans_found={'true' if orphan_count > 0 else 'false'}\n")
+
+          # Build a markdown table for the summary and issue body
+          lines = []
+          if orphan_count > 0:
+              for rtype in sorted(grouped.keys()):
+                  resources = grouped[rtype]
+                  lines.append(f"### {rtype} ({len(resources)})")
+                  lines.append("")
+                  lines.append("| Name | Location | Resource Group |")
+                  lines.append("| --- | --- | --- |")
+                  for r in resources:
+                      lines.append(f"| {r['name']} | {r['location']} | {r['resourceGroup']} |")
+                  lines.append("")
+
+          report = "\n".join(lines)
+          with open("/tmp/orphan-report.md", "w") as f:
+              f.write(report)
+
+          PYEOF
+
+      - name: Post orphan summary
+        if: steps.rg.outputs.rg_name != ''
+        run: |
+          ORPHAN_COUNT="${{ steps.orphans.outputs.orphan_count }}"
+
+          echo "## Orphan Resource Detection: ${{ matrix.environment }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${{ steps.orphans.outputs.orphans_found }}" = "true" ]; then
+            echo "**Status: ${ORPHAN_COUNT} ORPHAN(S) DETECTED**" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "The following Azure resources exist in the resource group but are **not managed by Terraform**:" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            cat /tmp/orphan-report.md >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "---" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "**Terraform managed resources:** ${{ steps.state.outputs.state_count }}" >> "$GITHUB_STEP_SUMMARY"
+            echo "**Azure resources in group:** ${{ steps.azure.outputs.azure_count }}" >> "$GITHUB_STEP_SUMMARY"
+            echo "**Orphaned resources:** ${ORPHAN_COUNT}" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "**Status: No orphans detected**" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "All resources in the resource group are managed by Terraform." >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "**Terraform managed resources:** ${{ steps.state.outputs.state_count }}" >> "$GITHUB_STEP_SUMMARY"
+            echo "**Azure resources in group:** ${{ steps.azure.outputs.azure_count }}" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Post summary when resource group not found
+        if: steps.rg.outputs.rg_name == ''
+        run: |
+          echo "## Orphan Resource Detection: ${{ matrix.environment }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Status: SKIPPED**" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Could not determine resource group name for this environment." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create GitHub issue for orphans
+        if: steps.orphans.outputs.orphans_found == 'true' && inputs.create_issues
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const env = '${{ matrix.environment }}';
+            const orphanCount = '${{ steps.orphans.outputs.orphan_count }}';
+            const repo = context.repo;
+            const title = `Orphan resources detected: ${env}`;
+            const assignees = '${{ inputs.issue_assignees }}'.split(',').map(s => s.trim()).filter(s => s);
+            const labels = '${{ inputs.issue_labels }}'.split(',').map(s => s.trim()).filter(s => s);
+
+            // Read the orphan report markdown
+            let orphanReport = '';
+            try {
+              orphanReport = fs.readFileSync('/tmp/orphan-report.md', 'utf8');
+            } catch (e) {
+              orphanReport = 'Unable to read orphan report.';
+            }
+
+            // Check if an open issue already exists for this environment
+            const existing = await github.rest.issues.listForRepo({
+              ...repo,
+              state: 'open',
+              labels: labels.join(','),
+            });
+
+            const existingIssue = existing.data.find(i => i.title === title);
+
+            const body = [
+              `## Orphan resources detected in \`${env}\``,
+              '',
+              `**Orphan count:** ${orphanCount}`,
+              `**Detected at:** ${new Date().toISOString()}`,
+              `**Workflow run:** ${context.serverUrl}/${repo.owner}/${repo.repo}/actions/runs/${context.runId}`,
+              '',
+              '### Orphan Resources',
+              '',
+              'The following Azure resources exist in the resource group but are **not managed by any Terraform state**:',
+              '',
+              orphanReport,
+              '',
+              '### Remediation Steps',
+              '',
+              'For each orphan resource, choose one of the following actions:',
+              '',
+              '1. **Import into Terraform** — if the resource should be managed:',
+              '   ```bash',
+              '   terraform import <resource_address> <azure_resource_id>',
+              '   ```',
+              '2. **Delete the resource** — if it is no longer needed:',
+              '   ```bash',
+              '   az resource delete --ids <azure_resource_id>',
+              '   ```',
+              '3. **Add to ignore list** — if it is expected and should be excluded from future scans',
+              '   (update the `EXCLUDED_TYPES` set in the orphan detection workflow)',
+              '',
+              '### Resolution',
+              '',
+              'Close this issue once all orphan resources have been addressed.',
+              'A new issue will be created if orphans are detected in future scans.',
+            ].join('\n');
+
+            if (existingIssue) {
+              // Update existing issue with a new comment
+              await github.rest.issues.createComment({
+                ...repo,
+                issue_number: existingIssue.number,
+                body: [
+                  `Orphan resources still present as of ${new Date().toISOString()}.`,
+                  '',
+                  `**Orphan count:** ${orphanCount}`,
+                  `**Run:** ${context.serverUrl}/${repo.owner}/${repo.repo}/actions/runs/${context.runId}`,
+                  '',
+                  orphanReport,
+                ].join('\n'),
+              });
+              core.info(`Updated existing issue #${existingIssue.number}`);
+            } else {
+              // Create new issue
+              const issue = await github.rest.issues.create({
+                ...repo,
+                title,
+                body,
+                assignees,
+                labels,
+              });
+              core.info(`Created issue #${issue.data.number}`);
+            }
